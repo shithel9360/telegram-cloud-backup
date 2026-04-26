@@ -73,9 +73,9 @@ def save_config(cfg: dict):
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
 
 def fmt_size(b):
-    if b>=1<<30: return f"{b/1<<30:.2f} GB"
-    if b>=1<<20: return f"{b/1<<20:.1f} MB"
-    if b>=1<<10: return f"{b/1<<10:.1f} KB"
+    if b>=(1<<30): return f"{b/(1<<30):.2f} GB"
+    if b>=(1<<20): return f"{b/(1<<20):.1f} MB"
+    if b>=(1<<10): return f"{b/(1<<10):.1f} KB"
     return f"{b} B"
 
 def detect_icloud():
