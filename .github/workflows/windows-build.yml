@@ -34,14 +34,11 @@ jobs:
         name: TelegramBackupPro-Windows
         path: dist/main_gui.exe
 
-    - name: Commit and Push EXE
+    - name: Create Release and Upload EXE
       run: |
         git config --global user.name "github-actions[bot]"
         git config --global user.email "github-actions[bot]@users.noreply.github.com"
-        if (!(Test-Path bin)) { New-Item -ItemType Directory -Path bin }
-        copy dist\main_gui.exe bin\TelegramBackupPro.exe
-        git add bin/TelegramBackupPro.exe
-        git commit -m "Auto-build: Update Windows EXE binary" || exit 0
-        git push origin master
+        $tag = "v" + (Get-Date -Format "yyyy.MM.dd.HHmm")
+        gh release create $tag dist\main_gui.exe --title "Backup Pro Build $tag" --notes "Automated pro-grade build with Setup Wizard and AI features."
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
