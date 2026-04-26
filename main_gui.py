@@ -79,9 +79,10 @@ class BackupProApp(ctk.CTk):
         scroll = ctk.CTkScrollableFrame(frame)
         scroll.pack(fill="both", expand=True, padx=20, pady=10)
         
-        self.api_id_val = self.add_entry(scroll, "API ID", "30449447")
-        self.api_hash_val = self.add_entry(scroll, "API Hash", "ec0f8e959edb27bc595b05f6b465bf04")
+        self.api_id_val = self.add_entry(scroll, "API ID", "")
+        self.api_hash_val = self.add_entry(scroll, "API Hash", "")
         self.phone_val = self.add_entry(scroll, "Phone Number", "+880")
+        self.channel_id_val = self.add_entry(scroll, "Channel ID", "")
         
         self.login_btn = ctk.CTkButton(frame, text="Connect to Telegram", command=self.do_login, fg_color="#0088cc", width=200)
         self.login_btn.pack(pady=20)
@@ -195,14 +196,22 @@ class BackupProApp(ctk.CTk):
 
     def select_source(self, source):
         self.show_frame("Config")
-        if source == "iCloud":
-            self.config_info.configure(text="Please ensure 'iCloud for Windows' is installed and you are logged into your Apple ID.\nClick Auto-Detect to find the folder automatically.")
-            self.auto_btn.configure(state="normal")
-            self.path_val.delete(0, "end")
-            self.path_val.insert(0, PHOTOS_ORIGINALS)
-        else:
-            self.config_info.configure(text="Please select the local folder containing your photos/videos.")
-            self.auto_btn.configure(state="disabled")
+        try:
+            config = load_config()
+            if source == "iCloud":
+                self.config_info.configure(text="Please ensure 'iCloud for Windows' is installed and you are logged into your Apple ID.\nClick Auto-Detect to find the folder automatically.")
+                self.auto_btn.configure(state="normal")
+                self.api_hash_val.delete(0, "end")
+                self.api_hash_val.insert(0, config.get("api_hash", ""))
+                self.channel_id_val.delete(0, "end")
+                self.channel_id_val.insert(0, str(config.get("channel_id", "")))
+                self.path_val.delete(0, "end")
+                self.path_val.insert(0, PHOTOS_ORIGINALS)
+            else:
+                self.config_info.configure(text="Please select the local folder containing your photos/videos.")
+                self.auto_btn.configure(state="disabled")
+        except Exception:
+            pass
 
     def manual_select_folder(self):
         p = ctk.filedialog.askdirectory()
@@ -220,7 +229,7 @@ class BackupProApp(ctk.CTk):
         config = {
             "api_id": self.api_id_val.get(),
             "api_hash": self.api_hash_val.get(),
-            "channel_id": "-1001810631058", # Default from user
+            "channel_id": self.channel_id_val.get(), # Dynamic from user input
             "photos_path": self.path_val.get(),
             "upload_mode": "Both", "convert_heic": True, "compress_videos": True, "free_up_space": False
         }
