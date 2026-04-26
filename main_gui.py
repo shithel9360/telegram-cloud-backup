@@ -66,6 +66,11 @@ class BackupProApp(ctk.CTk):
         self.api_hash_entry = self.add_setting("API Hash", "ec0f8e959edb27bc595b05f6b465bf04")
         self.channel_id_entry = self.add_setting("Channel ID", "-1001810631058")
         
+        ctk.CTkLabel(self.scroll_settings, text="Account Authorization", font=("Inter", 16, "bold")).pack(pady=10)
+        self.phone_entry = self.add_setting("Phone Number", "+880")
+        self.login_btn = ctk.CTkButton(self.scroll_settings, text="Telegram Login", command=self.telegram_login, fg_color="#0088cc")
+        self.login_btn.pack(pady=5)
+        
         ctk.CTkLabel(self.scroll_settings, text="Folder Settings", font=("Inter", 16, "bold")).pack(pady=10)
         
         self.path_entry = self.add_setting("Photos Folder", PHOTOS_ORIGINALS)
@@ -106,6 +111,50 @@ class BackupProApp(ctk.CTk):
         self.path_entry.delete(0, "end")
         self.path_entry.insert(0, path)
         self.log(f"Auto-detected path: {path}")
+
+    def telegram_login(self):
+        phone = self.phone_entry.get()
+        api_id = int(self.api_id_entry.get())
+        api_hash = self.api_hash_entry.get()
+        
+        from telethon import TelegramClient
+        from src.config import SESSION_FILE
+        
+        def run_login():
+            client = TelegramClient(SESSION_FILE, api_id, api_hash)
+            async def auth():
+                await client.connect()
+                if not await client.is_user_authorized():
+                    self.log(f"Sending code to {phone}...")
+                    sent = await client.send_code_request(phone)
+                    
+                    # We need to ask for OTP in main thread
+                    self.otp_done = threading.Event()
+                    self.otp_val = None
+                    
+                    def get_otp():
+                        dialog = ctk.CTkInputDialog(text="Enter the OTP from Telegram:", title="Verification")
+                        self.otp_val = dialog.get_input()
+                        self.otp_done.set()
+                        
+                    self.after(100, get_otp)
+                    self.otp_done.wait()
+                    
+                    if self.otp_val:
+                        try:
+                            await client.sign_in(phone, self.otp_val)
+                            self.log("✅ Login successful!")
+                        except Exception as e:
+                            self.log(f"❌ Login failed: {e}")
+                    else:
+                        self.log("Login cancelled.")
+                else:
+                    self.log("Already authorized!")
+                await client.disconnect()
+
+            asyncio.run(auth())
+
+        threading.Thread(target=run_login, daemon=True).start()
 
     def load_settings(self):
         try:
