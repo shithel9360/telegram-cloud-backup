@@ -301,6 +301,14 @@ class Handler(BaseHTTPRequestHandler):
             state["status"] = "stopped"
             self.send_json({"ok": True})
 
+        elif path == "/api/quit":
+            state["status"] = "stopped"
+            self.send_json({"ok": True})
+            def _shutdown():
+                time.sleep(1)
+                os._exit(0)
+            threading.Thread(target=_shutdown).start()
+
         else:
             self.send_response(404); self.end_headers()
 
@@ -374,7 +382,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <h2>Controls</h2>
       <div class="row">
         <button class="btn-primary" onclick="startBackup()">▶ Start Backup</button>
-        <button class="btn-red" onclick="stopBackup()">⏹ Stop</button>
+        <button class="btn-red" onclick="stopBackup()">⏹ Stop Backup</button>
+        <button style="background:#555;color:#fff;" onclick="quitApp()">⏏ Exit App Completely</button>
       </div>
     </div>
     <div class="card">
@@ -468,6 +477,12 @@ async function saveSettings(){
 
 async function startBackup(){ await api('POST','/api/start',{}); }
 async function stopBackup(){ await api('POST','/api/stop',{}); }
+async function quitApp(){ 
+  if(confirm('This will stop the backup and completely close the background engine. Are you sure?')) {
+    await api('POST','/api/quit',{}); 
+    document.body.innerHTML = '<h2 style="padding:40px;text-align:center;color:#8b949e">App closed. You can now close this browser tab.</h2>';
+  }
+}
 
 function setMsg(id,text,type){
   const el=document.getElementById(id);
