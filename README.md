@@ -1,5 +1,7 @@
 # 📸 Telegram Backup Pro
 
+**Developed by Shithel**
+
 A zero-setup, portable application to automatically back up your photos and videos (from iCloud, Google Drive, or any local folder) directly to a private Telegram channel. 
 
 Built for Windows. No installation required.

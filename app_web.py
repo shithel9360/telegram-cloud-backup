@@ -363,7 +363,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <body>
 <div class="app">
   <h1>📸 Telegram Backup Pro</h1>
-  <p class="sub">Backup your photos & videos to Telegram — automatically.</p>
+  <p class="sub">Backup your photos & videos to Telegram — automatically.<br><span style="color:#58a6ff;font-weight:600;">Developed by Shithel</span></p>
 
   <div class="tabs">
     <div class="tab active" onclick="showTab('dashboard')">Dashboard</div>
