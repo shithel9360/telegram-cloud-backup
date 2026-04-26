@@ -519,6 +519,9 @@ if __name__ == "__main__":
     print(f"  Open: http://localhost:{PORT}")
     print(f"{'='*50}\n")
 
+    import webbrowser
+    threading.Timer(1.0, lambda: webbrowser.open(f"http://127.0.0.1:{PORT}")).start()
+
     server = HTTPServer(("127.0.0.1", PORT), Handler)
     try:
         server.serve_forever()

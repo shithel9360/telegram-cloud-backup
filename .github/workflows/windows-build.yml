@@ -22,23 +22,23 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install customtkinter pystray piexif ffmpeg-python opencv-python fastapi uvicorn sqlalchemy jinja2 pyinstaller Pillow telethon
+        pip install telethon pyinstaller
         
     - name: Build with PyInstaller
       run: |
-        pyinstaller --noconsole --onefile --add-data "src/api/templates;src/api/templates" main_gui.py
+        pyinstaller --onefile --name TelegramBackup app_web.py
         
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
         name: TelegramBackupPro-Windows
-        path: dist/main_gui.exe
+        path: dist/TelegramBackup.exe
 
     - name: Create Release and Upload EXE
       run: |
         git config --global user.name "github-actions[bot]"
         git config --global user.email "github-actions[bot]@users.noreply.github.com"
         $tag = "v" + (Get-Date -Format "yyyy.MM.dd.HHmm")
-        gh release create $tag dist\main_gui.exe --title "Backup Pro Build $tag" --notes "Automated pro-grade build with Setup Wizard and AI features."
+        gh release create $tag dist\TelegramBackup.exe --title "Backup Pro Web Edition $tag" --notes "One-click portable Web App version. Just double click to run!"
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
