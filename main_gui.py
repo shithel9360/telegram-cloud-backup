@@ -68,9 +68,13 @@ class BackupProApp(ctk.CTk):
         
         ctk.CTkLabel(self.scroll_settings, text="Folder Settings", font=("Inter", 16, "bold")).pack(pady=10)
         
-        from src.config import PHOTOS_ORIGINALS
         self.path_entry = self.add_setting("Photos Folder", PHOTOS_ORIGINALS)
-        ctk.CTkButton(self.scroll_settings, text="Select Folder", command=self.select_folder).pack(pady=5)
+        
+        btn_path_frame = ctk.CTkFrame(self.scroll_settings, fg_color="transparent")
+        btn_path_frame.pack(pady=5)
+        
+        ctk.CTkButton(btn_path_frame, text="Select Folder", command=self.select_folder).pack(side="left", padx=5)
+        ctk.CTkButton(btn_path_frame, text="Auto-Detect iCloud", command=self.auto_detect_icloud, fg_color="green").pack(side="left", padx=5)
         
         self.save_btn = ctk.CTkButton(self.tab_settings, text="Save Settings", command=self.save_settings)
         self.save_btn.pack(pady=20)
@@ -95,6 +99,13 @@ class BackupProApp(ctk.CTk):
         if folder:
             self.path_entry.delete(0, "end")
             self.path_entry.insert(0, folder)
+
+    def auto_detect_icloud(self):
+        from src.config import get_icloud_path
+        path = get_icloud_path()
+        self.path_entry.delete(0, "end")
+        self.path_entry.insert(0, path)
+        self.log(f"Auto-detected path: {path}")
 
     def load_settings(self):
         try:
