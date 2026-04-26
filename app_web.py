@@ -210,10 +210,12 @@ async def _send_otp(phone):
     sent = await client.send_code_request(phone)
     _login_state["hash"] = sent.phone_code_hash
     _login_state["phone"] = phone
-    _login_state["client"] = client
+    await client.disconnect()
 
 async def _verify_otp(code):
-    client = _login_state.get("client")
+    from telethon import TelegramClient
+    client = TelegramClient(SESSION_FILE, TELEGRAM_API_ID, TELEGRAM_API_HASH)
+    await client.connect()
     await client.sign_in(_login_state["phone"], code, phone_code_hash=_login_state["hash"])
     me = await client.get_me()
     state["authorized"] = True
