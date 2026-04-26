@@ -76,16 +76,20 @@ class BackupProApp(ctk.CTk):
         frame = ctk.CTkFrame(self.container)
         ctk.CTkLabel(frame, text="Step 1: Telegram Authorization", font=("Inter", 24, "bold")).pack(pady=20)
         
-        scroll = ctk.CTkScrollableFrame(frame)
-        scroll.pack(fill="both", expand=True, padx=20, pady=10)
+        info_text = "Enter your phone number to receive a login code from Telegram.\nNo technical setup required!"
+        ctk.CTkLabel(frame, text=info_text, font=("Inter", 13)).pack(pady=10)
+
+        scroll = ctk.CTkFrame(frame, fg_color="transparent")
+        scroll.pack(fill="x", padx=40, pady=20)
         
-        self.api_id_val = self.add_entry(scroll, "API ID", "")
-        self.api_hash_val = self.add_entry(scroll, "API Hash", "")
         self.phone_val = self.add_entry(scroll, "Phone Number", "+880")
-        self.channel_id_val = self.add_entry(scroll, "Channel ID", "")
+        self.channel_id_val = self.add_entry(scroll, "Channel ID", "-100")
         
-        self.login_btn = ctk.CTkButton(frame, text="Connect to Telegram", command=self.do_login, fg_color="#0088cc", width=200)
-        self.login_btn.pack(pady=20)
+        tip_text = "Tip: You can find your Channel ID in the channel info or via @userinfobot"
+        ctk.CTkLabel(frame, text=tip_text, font=("Inter", 11, "italic"), text_color="gray").pack()
+
+        self.login_btn = ctk.CTkButton(frame, text="Send Login Code", command=self.do_login, fg_color="#0088cc", width=250, height=45)
+        self.login_btn.pack(pady=30)
         
         self.login_status = ctk.CTkLabel(frame, text="")
         self.login_status.pack()
@@ -160,8 +164,9 @@ class BackupProApp(ctk.CTk):
 
     def do_login(self):
         phone = self.phone_val.get()
-        api_id = int(self.api_id_val.get())
-        api_hash = self.api_hash_val.get()
+        # Embedded API Credentials for simplified onboarding
+        api_id = 36355055
+        api_hash = "9b819327f0403ce37b08e316a8464cb6"
         
         from telethon import TelegramClient
         def run():
@@ -201,8 +206,6 @@ class BackupProApp(ctk.CTk):
             if source == "iCloud":
                 self.config_info.configure(text="Please ensure 'iCloud for Windows' is installed and you are logged into your Apple ID.\nClick Auto-Detect to find the folder automatically.")
                 self.auto_btn.configure(state="normal")
-                self.api_hash_val.delete(0, "end")
-                self.api_hash_val.insert(0, config.get("api_hash", ""))
                 self.channel_id_val.delete(0, "end")
                 self.channel_id_val.insert(0, str(config.get("channel_id", "")))
                 self.path_val.delete(0, "end")
@@ -227,8 +230,8 @@ class BackupProApp(ctk.CTk):
 
     def finish_setup(self):
         config = {
-            "api_id": self.api_id_val.get(),
-            "api_hash": self.api_hash_val.get(),
+            "api_id": 36355055,
+            "api_hash": "9b819327f0403ce37b08e316a8464cb6",
             "channel_id": self.channel_id_val.get(), # Dynamic from user input
             "photos_path": self.path_val.get(),
             "upload_mode": "Both", "convert_heic": True, "compress_videos": True, "free_up_space": False
