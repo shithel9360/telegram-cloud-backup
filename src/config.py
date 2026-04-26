@@ -1,12 +1,17 @@
 import os
-
-CONFIG_FILE = os.path.expanduser("~/.tele_backup_config.json")
-DB_FILE = os.path.expanduser("~/.tele_backup_state.db")
 import sys
 
 CONFIG_FILE = os.path.expanduser("~/.tele_backup_config.json")
 DB_FILE = os.path.expanduser("~/.tele_backup_state.db")
 SESSION_FILE = os.path.expanduser("~/.tele_backup_session")
+
+if sys.platform == "win32":
+    LOG_DIR = os.path.expandvars("%APPDATA%\\TelegramPhotosBackup")
+else:
+    LOG_DIR = os.path.expanduser("~/Library/Logs/TelegramPhotosBackup")
+
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, "backup.log")
 
 def get_icloud_path():
     """Attempt to auto-detect iCloud Photos path on Windows."""
@@ -25,7 +30,6 @@ def get_icloud_path():
     return candidates[0] # Return default if none found
 
 PHOTOS_ORIGINALS = get_icloud_path()
-LOG_FILE = os.path.join(LOG_DIR, "backup.log")
 
 POLL_INTERVAL = 5
 MIN_FILE_AGE = 3
