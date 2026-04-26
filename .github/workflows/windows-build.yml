@@ -38,10 +38,10 @@ jobs:
       run: |
         git config --global user.name "github-actions[bot]"
         git config --global user.email "github-actions[bot]@users.noreply.github.com"
-        mkdir -p bin
+        if (!(Test-Path bin)) { New-Item -ItemType Directory -Path bin }
         copy dist\main_gui.exe bin\TelegramBackupPro.exe
         git add bin/TelegramBackupPro.exe
-        git commit -m "Auto-build: Update Windows EXE binary"
+        git commit -m "Auto-build: Update Windows EXE binary" || exit 0
         git push origin master
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
