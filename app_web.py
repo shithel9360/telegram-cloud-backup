@@ -144,7 +144,7 @@ async def _daemon(cfg):
                 async with lock:
                     if is_uploaded(conn, fhash): continue
                 if now - mtime < 3: continue
-                tasks.append(_upload_one(client, conn, channel_id, fp, sz, fhash, sem, lock, export))
+                tasks.append(_upload_one(client, conn, channel_id, fp, sz, fhash, sem, lock, export, cfg.get("delete_after", False)))
 
             if tasks:
                 results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -168,7 +168,7 @@ async def _daemon(cfg):
     await client.disconnect()
     push_log("🛑 Daemon stopped.")
 
-async def _upload_one(client, conn, channel_id, fp, sz, fhash, sem, lock, export_dir):
+async def _upload_one(client, conn, channel_id, fp, sz, fhash, sem, lock, export_dir, delete_after=False):
     fname = os.path.basename(fp)
     async with lock:
         if is_uploaded(conn, fhash): return False
@@ -185,6 +185,12 @@ async def _upload_one(client, conn, channel_id, fp, sz, fhash, sem, lock, export
             await client.send_file(channel_id, str(tmp), caption=cap, force_document=True)
             async with lock: mark_uploaded(conn, fhash, fname, sz)
             if tmp.exists(): tmp.unlink()
+            if delete_after:
+                try:
+                    os.remove(fp)
+                    push_log(f"🗑️ Deleted original to free space: {fname}")
+                except Exception as e:
+                    push_log(f"⚠️ Could not delete {fname}: {e}")
             return True
         except Exception as e:
             push_log(f"❌ Failed {fname}: {e}")
@@ -419,7 +425,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <input id="photos_path" placeholder="C:\\Users\\You\\Pictures\\iCloud Photos\\Photos" />
         <button class="btn-blue btn-sm" onclick="detectiCloud()">Auto-Detect iCloud</button>
       </div>
-      <button class="btn-primary" onclick="saveSettings()">Save Settings</button>
+      <div class="row" style="margin-top:16px;">
+        <label style="min-width:auto;cursor:pointer;">
+          <input type="checkbox" id="delete_after" style="min-width:auto;margin-right:8px;vertical-align:middle;">
+          Delete local files after successful upload (Free up iCloud/Disk space)
+        </label>
+      </div>
+      <button class="btn-primary" style="margin-top:20px;" onclick="saveSettings()">Save Settings</button>
       <div id="settings-msg"></div>
     </div>
   </div>
@@ -471,7 +483,8 @@ async function detectiCloud(){
 
 async function saveSettings(){
   const path=document.getElementById('photos_path').value.trim();
-  const r=await api('POST','/api/save_config',{photos_path:path});
+  const del=document.getElementById('delete_after').checked;
+  const r=await api('POST','/api/save_config',{photos_path:path, delete_after:del});
   setMsg('settings-msg', r.ok?'✅ Saved!':'❌ Error','ok');
 }
 
@@ -515,6 +528,7 @@ async function loadConfig(){
     if(c.phone) document.getElementById('phone').value=c.phone;
     if(c.channel_id) document.getElementById('channel_id').value=c.channel_id;
     if(c.photos_path) document.getElementById('photos_path').value=c.photos_path;
+    if(c.delete_after) document.getElementById('delete_after').checked=true;
   }catch(e){}
 }
 
