@@ -1,0 +1,33 @@
+name: Build Windows Executable
+
+on:
+  push:
+    branches: [ master, main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install customtkinter pystray piexif ffmpeg-python opencv-python fastapi uvicorn sqlalchemy jinja2 pyinstaller Pillow telethon
+        
+    - name: Build with PyInstaller
+      run: |
+        pyinstaller --noconsole --onefile --add-data "src/api/templates;src/api/templates" main_gui.py
+        
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: TelegramBackupPro-Windows
+        path: dist/main_gui.exe
