@@ -10,7 +10,7 @@ import sys
 from src.core.daemon import run_daemon
 from src.api.server import start_server, state as api_state
 from src.core.db import get_stats, init_db
-from src.core.utils import format_size
+from src.utils import format_size
 
 class BackupProApp(ctk.CTk):
     def __init__(self):
