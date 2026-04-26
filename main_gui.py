@@ -88,6 +88,10 @@ class BackupProApp(ctk.CTk):
             self.running = False
             self.start_btn.configure(text="Start Backup", fg_color="#1f538d")
 
+    def open_dashboard(self):
+        import webbrowser
+        webbrowser.open("http://127.0.0.1:8000")
+
     def hide_window(self):
         self.withdraw()
         self.show_tray_icon()
