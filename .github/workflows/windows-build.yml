@@ -8,12 +8,14 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    permissions:
+      contents: write
     
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: '3.9'
         
@@ -27,7 +29,19 @@ jobs:
         pyinstaller --noconsole --onefile --add-data "src/api/templates;src/api/templates" main_gui.py
         
     - name: Upload Artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: TelegramBackupPro-Windows
         path: dist/main_gui.exe
+
+    - name: Commit and Push EXE
+      run: |
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "github-actions[bot]@users.noreply.github.com"
+        mkdir -p bin
+        copy dist\main_gui.exe bin\TelegramBackupPro.exe
+        git add bin/TelegramBackupPro.exe
+        git commit -m "Auto-build: Update Windows EXE binary"
+        git push origin master
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
