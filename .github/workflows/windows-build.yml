@@ -26,33 +26,30 @@ jobs:
 
     - name: Extract version from app_web.py
       id: get_version
+      shell: pwsh
       run: |
         $ver = python -c "import re; m=re.search(r'APP_VERSION\s*=\s*\"([^\"]+)\"', open('app_web.py').read()); print(m.group(1))"
         echo "VERSION=$ver" >> $env:GITHUB_OUTPUT
 
     - name: Delete existing release if same version exists
       continue-on-error: true
+      shell: pwsh
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         gh release delete "v${{ steps.get_version.outputs.VERSION }}" -y
         git push --delete origin "v${{ steps.get_version.outputs.VERSION }}"
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Build with PyInstaller
+      shell: pwsh
       run: |
         pyinstaller --onefile --noconsole --name TelegramBackup app_web.py
 
-    - name: Create Release with version tag
-      run: |
-        $tag = "v${{ steps.get_version.outputs.VERSION }}"
-        gh release create $tag dist\TelegramBackup.exe `
-          --title "Telegram Backup Pro v${{ steps.get_version.outputs.VERSION }}" `
-          --notes "## What's new in this version
-          
-- Download and double-click TelegramBackup.exe to run
-- The app opens in your browser automatically  
-- No installation required
-          
-**Developed by Shithel**"
+    - name: Create Release
+      shell: pwsh
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        $tag = "v${{ steps.get_version.outputs.VERSION }}"
+        $notes = "Download TelegramBackup.exe and double-click to run. Your browser opens automatically.`n`nDeveloped by Shithel"
+        gh release create $tag dist\TelegramBackup.exe --title "Telegram Backup Pro $tag" --notes $notes
