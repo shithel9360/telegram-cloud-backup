@@ -20,6 +20,12 @@ PORT         = 7878
 TELEGRAM_API_ID   = 36355055
 TELEGRAM_API_HASH = "9b819327f0403ce37b08e316a8464cb6"
 
+APP_VERSION  = "2.0.0"          # bumped on every release
+GITHUB_REPO  = "shithel9360/telegram-cloud-backup"
+RELEASES_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+
+update_state = {"available": False, "latest": APP_VERSION, "url": ""}
+
 IMAGE_EXT = ('.jpg','.jpeg','.png','.heic','.gif','.raw','.dng','.bmp','.webp')
 VIDEO_EXT = ('.mov','.mp4','.m4v','.avi','.mkv')
 ALL_EXT   = IMAGE_EXT + VIDEO_EXT
@@ -87,6 +93,40 @@ def detect_icloud():
     for c in candidates:
         if c.exists(): return str(c)
     return str(Path.home()/"Pictures")
+
+# ── Auto-updater ──────────────────────────────────────────────────────────────
+def check_for_update():
+    """Check GitHub for a newer release version. Runs in background thread."""
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            RELEASES_URL,
+            headers={"User-Agent": f"TelegramBackupPro/{APP_VERSION}"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+        latest_tag  = data.get("tag_name", APP_VERSION).lstrip("v")
+        assets      = data.get("assets", [])
+        exe_asset   = next((a for a in assets if a["name"].endswith(".exe")), None)
+        dl_url      = exe_asset["browser_download_url"] if exe_asset else data.get("html_url", "")
+
+        def _ver_tuple(v):
+            try: return tuple(int(x) for x in v.replace("-",".",1).split(".")[:4])
+            except: return (0,)
+
+        if _ver_tuple(latest_tag) > _ver_tuple(APP_VERSION):
+            update_state["available"] = True
+            update_state["latest"]    = latest_tag
+            update_state["url"]       = dl_url
+            push_log(f"🆕 Update available: v{latest_tag} — check the dashboard!")
+    except Exception:
+        pass  # silently ignore network errors
+
+def _update_check_loop():
+    """Repeat update check every 30 minutes."""
+    while True:
+        check_for_update()
+        time.sleep(1800)
 
 # ── Backup daemon ─────────────────────────────────────────────────────────────
 _daemon_loop: asyncio.AbstractEventLoop = None
@@ -173,6 +213,7 @@ async def _upload_one(client, conn, channel_id, fp, sz, fhash, sem, lock, export
     async with lock:
         if is_uploaded(conn, fhash): return False
         mark_uploaded(conn, fhash, f"IN_FLIGHT_{fname}", sz)
+    tmp = None
     async with sem:
         try:
             ts   = int(time.time()*1000)
@@ -184,19 +225,21 @@ async def _upload_one(client, conn, channel_id, fp, sz, fhash, sem, lock, export
             push_log(f"⬆️  Uploading {fname}…")
             await client.send_file(channel_id, str(tmp), caption=cap, force_document=True)
             async with lock: mark_uploaded(conn, fhash, fname, sz)
-            if tmp.exists(): tmp.unlink()
+            if tmp and tmp.exists(): tmp.unlink()
             if delete_after:
                 try:
                     os.remove(fp)
                     push_log(f"🗑️ Deleted original to free space: {fname}")
-                except Exception as e:
-                    push_log(f"⚠️ Could not delete {fname}: {e}")
+                except Exception as del_e:
+                    push_log(f"⚠️ Could not delete {fname}: {del_e}")
             return True
         except Exception as e:
             push_log(f"❌ Failed {fname}: {e}")
             async with lock:
                 conn.execute("DELETE FROM uploads WHERE uuid=?", (fhash,)); conn.commit()
-            if tmp.exists(): tmp.unlink()
+            if tmp and tmp.exists():
+                try: tmp.unlink()
+                except Exception: pass
             return False
 
 def start_daemon():
@@ -261,6 +304,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(load_config())
         elif path == "/api/detect_icloud":
             self.send_json({"path": detect_icloud()})
+        elif path == "/api/update_info":
+            self.send_json({**update_state, "current": APP_VERSION})
         else:
             self.send_response(404); self.end_headers()
 
@@ -370,6 +415,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <div class="app">
   <h1>📸 Telegram Backup Pro</h1>
   <p class="sub">Backup your photos & videos to Telegram — automatically.<br><span style="color:#58a6ff;font-weight:600;">Developed by Shithel</span></p>
+
+  <div id="update-banner" style="display:none;background:#1c2a14;border:1px solid #3fb950;border-radius:10px;padding:12px 18px;margin-bottom:16px;display:none;align-items:center;gap:12px;">
+    <span style="font-size:1.1rem;">🆕</span>
+    <span id="update-text" style="flex:1;font-size:.9rem;"></span>
+    <a id="update-link" href="#" target="_blank" style="background:#238636;color:#fff;padding:7px 16px;border-radius:6px;text-decoration:none;font-size:.85rem;font-weight:600;">Download Update</a>
+  </div>
 
   <div class="tabs">
     <div class="tab active" onclick="showTab('dashboard')">Dashboard</div>
@@ -535,6 +586,20 @@ async function loadConfig(){
 loadConfig();
 setInterval(poll,2500);
 poll();
+
+async function checkUpdate(){
+  try{
+    const u=await api('GET','/api/update_info');
+    if(u.available){
+      const b=document.getElementById('update-banner');
+      document.getElementById('update-text').textContent=`New version v${u.latest} is available! (You have v${u.current})`;
+      document.getElementById('update-link').href=u.url;
+      b.style.display='flex';
+    }
+  }catch(e){}
+}
+checkUpdate();
+setInterval(checkUpdate,300000);
 </script>
 </body>
 </html>"""
@@ -552,6 +617,7 @@ if __name__ == "__main__":
 
     import webbrowser
     threading.Timer(1.0, lambda: webbrowser.open(f"http://127.0.0.1:{PORT}")).start()
+    threading.Thread(target=_update_check_loop, daemon=True).start()
 
     server = HTTPServer(("127.0.0.1", PORT), Handler)
     try:

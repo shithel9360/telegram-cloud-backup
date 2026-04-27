@@ -10,35 +10,49 @@ jobs:
     runs-on: windows-latest
     permissions:
       contents: write
-    
+
     steps:
     - uses: actions/checkout@v4
-    
+
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: '3.9'
-        
+        python-version: '3.11'
+
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install telethon pyinstaller
-        
+        pip install telethon pyinstaller requests
+
+    - name: Extract version from app_web.py
+      id: get_version
+      run: |
+        $ver = python -c "import re; m=re.search(r'APP_VERSION\s*=\s*\"([^\"]+)\"', open('app_web.py').read()); print(m.group(1))"
+        echo "VERSION=$ver" >> $env:GITHUB_OUTPUT
+
+    - name: Delete existing release if same version exists
+      continue-on-error: true
+      run: |
+        gh release delete "v${{ steps.get_version.outputs.VERSION }}" -y
+        git push --delete origin "v${{ steps.get_version.outputs.VERSION }}"
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
     - name: Build with PyInstaller
       run: |
         pyinstaller --onefile --noconsole --name TelegramBackup app_web.py
-        
-    - name: Upload Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: TelegramBackupPro-Windows
-        path: dist/TelegramBackup.exe
 
-    - name: Create Release and Upload EXE
+    - name: Create Release with version tag
       run: |
-        git config --global user.name "github-actions[bot]"
-        git config --global user.email "github-actions[bot]@users.noreply.github.com"
-        $tag = "v" + (Get-Date -Format "yyyy.MM.dd.HHmm")
-        gh release create $tag dist\TelegramBackup.exe --title "Backup Pro Web Edition $tag" --notes "One-click portable Web App version. Just double click to run!"
+        $tag = "v${{ steps.get_version.outputs.VERSION }}"
+        gh release create $tag dist\TelegramBackup.exe `
+          --title "Telegram Backup Pro v${{ steps.get_version.outputs.VERSION }}" `
+          --notes "## What's new in this version
+          
+- Download and double-click TelegramBackup.exe to run
+- The app opens in your browser automatically  
+- No installation required
+          
+**Developed by Shithel**"
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
