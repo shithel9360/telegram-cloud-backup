@@ -28,8 +28,14 @@ jobs:
       id: get_version
       shell: pwsh
       run: |
-        $ver = python -c "import re; m=re.search(r'APP_VERSION\s*=\s*\"([^\"]+)\"', open('app_web.py').read()); print(m.group(1))"
+        $code = Get-Content app_web.py -Raw
+        if ($code -match 'APP_VERSION\s*=\s*"([^"]+)"') {
+          $ver = $matches[1]
+        } else {
+          $ver = "1.0.0"
+        }
         echo "VERSION=$ver" >> $env:GITHUB_OUTPUT
+        echo "Detected version: $ver"
 
     - name: Delete existing release if same version exists
       continue-on-error: true
