@@ -20,7 +20,7 @@ PORT         = 7878
 TELEGRAM_API_ID   = 36355055
 TELEGRAM_API_HASH = "9b819327f0403ce37b08e316a8464cb6"
 
-APP_VERSION  = "2.0.0"          # bumped on every release
+APP_VERSION  = "2.1.0"          # bumped on every release
 GITHUB_REPO  = "shithel9360/telegram-cloud-backup"
 RELEASES_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -36,6 +36,25 @@ logging.basicConfig(
     handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8"), logging.StreamHandler()]
 )
 logger = logging.getLogger("BackupPro")
+
+# ── Startup helpers ───────────────────────────────────────────────────────────
+def set_windows_startup(enabled: bool):
+    if sys.platform != "win32": return
+    try:
+        import winreg
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        app_name = "TelegramBackupPro"
+        exe_path = sys.executable
+        if not getattr(sys, 'frozen', False): return
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE)
+        if enabled:
+            winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ, f'"{exe_path}" --silent')
+        else:
+            try: winreg.DeleteValue(key, app_name)
+            except FileNotFoundError: pass
+        winreg.CloseKey(key)
+    except Exception as e:
+        logger.error(f"Failed to set startup: {e}")
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 state = {
@@ -339,6 +358,8 @@ class Handler(BaseHTTPRequestHandler):
             cfg = load_config()
             cfg.update(body)
             save_config(cfg)
+            if "windows_startup" in body:
+                set_windows_startup(body["windows_startup"])
             self.send_json({"ok": True})
 
         elif path == "/api/start":
@@ -482,6 +503,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           Delete local files after successful upload (Free up iCloud/Disk space)
         </label>
       </div>
+      <div class="row" style="margin-top:8px;">
+        <label style="min-width:auto;cursor:pointer;">
+          <input type="checkbox" id="windows_startup" style="min-width:auto;margin-right:8px;vertical-align:middle;">
+          Start app automatically when Windows boots
+        </label>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <label style="min-width:auto;cursor:pointer;">
+          <input type="checkbox" id="auto_start_backup" style="min-width:auto;margin-right:8px;vertical-align:middle;">
+          Auto-start backup immediately when app opens
+        </label>
+      </div>
       <button class="btn-primary" style="margin-top:20px;" onclick="saveSettings()">Save Settings</button>
       <div id="settings-msg"></div>
     </div>
@@ -535,7 +568,14 @@ async function detectiCloud(){
 async function saveSettings(){
   const path=document.getElementById('photos_path').value.trim();
   const del=document.getElementById('delete_after').checked;
-  const r=await api('POST','/api/save_config',{photos_path:path, delete_after:del});
+  const startup=document.getElementById('windows_startup').checked;
+  const auto=document.getElementById('auto_start_backup').checked;
+  const r=await api('POST','/api/save_config',{
+    photos_path:path, 
+    delete_after:del,
+    windows_startup:startup,
+    auto_start_backup:auto
+  });
   setMsg('settings-msg', r.ok?'✅ Saved!':'❌ Error','ok');
 }
 
@@ -580,6 +620,8 @@ async function loadConfig(){
     if(c.channel_id) document.getElementById('channel_id').value=c.channel_id;
     if(c.photos_path) document.getElementById('photos_path').value=c.photos_path;
     if(c.delete_after) document.getElementById('delete_after').checked=true;
+    if(c.windows_startup) document.getElementById('windows_startup').checked=true;
+    if(c.auto_start_backup) document.getElementById('auto_start_backup').checked=true;
   }catch(e){}
 }
 
@@ -606,17 +648,28 @@ setInterval(checkUpdate,300000);
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    cfg = load_config()
+
     # Check if already authorized
     if Path(SESSION_FILE).exists():
         state["authorized"] = True
 
+    # Auto-start backup if configured
+    if cfg.get("auto_start_backup") and cfg.get("channel_id") and cfg.get("photos_path"):
+        state["status"] = "running"
+        push_log("🚀 Auto-starting backup...")
+        threading.Thread(target=start_daemon, daemon=True).start()
+
     print(f"\n{'='*50}")
-    print(f"  Telegram Backup Pro")
+    print(f"  Telegram Backup Pro v{APP_VERSION}")
     print(f"  Open: http://localhost:{PORT}")
     print(f"{'='*50}\n")
 
-    import webbrowser
-    threading.Timer(1.0, lambda: webbrowser.open(f"http://127.0.0.1:{PORT}")).start()
+    # Silent flag (used for startup) prevents opening browser
+    if "--silent" not in sys.argv:
+        import webbrowser
+        threading.Timer(1.5, lambda: webbrowser.open(f"http://127.0.0.1:{PORT}")).start()
+
     threading.Thread(target=_update_check_loop, daemon=True).start()
 
     server = HTTPServer(("127.0.0.1", PORT), Handler)
