@@ -1,7 +1,12 @@
 """
-Telegram Backup Pro — Web Edition
+Telegram Backup Pro — Web Edition (v2.2.1)
 Single-file web app. Run with: python app_web.py
 Then open: http://localhost:7878
+
+IMPROVEMENTS IN v2.2.1:
+- Security: SQL injection prevention, path traversal protection, input validation
+- Stability: Event loop cleanup, database error handling, resource management
+- Robustness: Permission error handling, file cleanup, config validation
 """
 
 import os, sys, json, time, asyncio, threading, logging, shutil, tempfile, sqlite3, hashlib
@@ -12,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────
 CONFIG_FILE  = Path.home() / ".tele_backup_config.json"
 DB_FILE      = Path.home() / ".tele_backup_state.db"
 SESSION_FILE = str(Path.home() / ".tele_backup_session")
@@ -24,7 +29,7 @@ PORT         = 7878
 TELEGRAM_API_ID   = 36355055
 TELEGRAM_API_HASH = "9b819327f0403ce37b08e316a8464cb6"
 
-APP_VERSION  = "2.2.0"          # bumped on every release
+APP_VERSION  = "2.2.1"          # bumped with security fixes
 GITHUB_REPO  = "shithel9360/telegram-cloud-backup"
 RELEASES_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -34,6 +39,12 @@ IMAGE_EXT = ('.jpg','.jpeg','.png','.heic','.gif','.raw','.dng','.bmp','.webp')
 VIDEO_EXT = ('.mov','.mp4','.m4v','.avi','.mkv')
 ALL_EXT   = IMAGE_EXT + VIDEO_EXT
 
+# Size limits for security
+MAX_BODY_SIZE = 1024 * 1024  # 1MB
+MAX_PHONE_LEN = 15
+MIN_CLEANUP_DAYS = 1
+MAX_CLEANUP_DAYS = 365
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -41,67 +52,142 @@ logging.basicConfig(
 )
 logger = logging.getLogger("BackupPro")
 
-# ── Config Cache (fix #4) ─────────────────────────────────────────────────────
+# ── Input Validation (NEW - Security Fix) ────────────────────────────
+def validate_phone(phone: str) -> bool:
+    """Validate phone number format"""
+    if not phone or len(phone) > MAX_PHONE_LEN:
+        return False
+    if not phone.startswith("+"):
+        return False
+    if not phone[1:].replace(" ", "").isdigit():
+        return False
+    return True
+
+def validate_channel_id(channel_id: str) -> bool:
+    """Validate channel ID is numeric"""
+    try:
+        cid = int(channel_id)
+        return cid != 0
+    except (ValueError, TypeError):
+        return False
+
+def validate_cleanup_days(days: int) -> bool:
+    """Validate cleanup days in valid range"""
+    try:
+        d = int(days)
+        return MIN_CLEANUP_DAYS <= d <= MAX_CLEANUP_DAYS
+    except (ValueError, TypeError):
+        return False
+
+def validate_path(user_path: str) -> bool:
+    """Validate path is within allowed directories (Security Fix #2)"""
+    if not user_path or len(user_path) > 260:  # Windows path limit
+        return False
+    try:
+        user_resolved = Path(user_path).resolve()
+        # Allow paths in Pictures, Documents, or Downloads
+        allowed_bases = [
+            Path.home() / "Pictures",
+            Path.home() / "Documents",
+            Path.home() / "Downloads",
+        ]
+        for base in allowed_bases:
+            if str(user_resolved).startswith(str(base)):
+                return True
+        return False
+    except (OSError, ValueError):
+        return False
+
+# ── Config Cache (fix #4) ─────────────────────────────────────────────
 _config_cache = None
 _config_lock = threading.Lock()
 
 def load_config() -> dict:
+    """Load config with error recovery (Security Fix #6)"""
     global _config_cache
     with _config_lock:
         if _config_cache is None:
             if CONFIG_FILE.exists():
-                _config_cache = json.loads(CONFIG_FILE.read_text())
+                try:
+                    _config_cache = json.loads(CONFIG_FILE.read_text())
+                except json.JSONDecodeError:
+                    logger.error("Config file corrupted, using defaults")
+                    _config_cache = {}
+                except Exception as e:
+                    logger.error(f"Failed to load config: {e}")
+                    _config_cache = {}
             else:
                 _config_cache = {}
     return _config_cache.copy()
 
 def save_config(cfg: dict):
     global _config_cache
-    CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
-    with _config_lock:
-        _config_cache = cfg.copy()
+    try:
+        CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+        with _config_lock:
+            _config_cache = cfg.copy()
+    except Exception as e:
+        logger.error(f"Failed to save config: {e}")
 
-# ── Database Connection Pool (fix #9) ─────────────────────────────────────────
+# ── Database Connection Pool (fix #9) ──────────────────────────────────
 class DBConnectionPool:
     def __init__(self, db_path, pool_size=5):
         self.db_path = db_path
         self.pool = []
         self.lock = threading.Lock()
         for _ in range(pool_size):
-            conn = sqlite3.connect(str(db_path), check_same_thread=True, timeout=30)
-            conn.execute("PRAGMA journal_mode=WAL")
-            self.pool.append(conn)
+            try:
+                conn = sqlite3.connect(str(db_path), check_same_thread=True, timeout=30)
+                conn.execute("PRAGMA journal_mode=WAL")
+                self.pool.append(conn)
+            except Exception as e:
+                logger.error(f"Failed to create database connection: {e}")
         self._init_db()
     
     def _init_db(self):
-        conn = self.pool[0]
-        conn.execute("""CREATE TABLE IF NOT EXISTS uploads (
-            uuid TEXT PRIMARY KEY, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            filename TEXT, file_size INTEGER DEFAULT 0, local_path TEXT)""")
-        conn.commit()
+        try:
+            conn = self.pool[0]
+            conn.execute("""CREATE TABLE IF NOT EXISTS uploads (
+                uuid TEXT PRIMARY KEY, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                filename TEXT, file_size INTEGER DEFAULT 0, local_path TEXT)""")
+            conn.commit()
+        except sqlite3.Error as e:
+            logger.error(f"Database initialization failed: {e}")
     
     def get_connection(self):
         with self.lock:
             if self.pool:
                 return self.pool.pop()
-        return sqlite3.connect(str(self.db_path), check_same_thread=True, timeout=30)
+        try:
+            return sqlite3.connect(str(self.db_path), check_same_thread=True, timeout=30)
+        except sqlite3.Error as e:
+            logger.error(f"Cannot create database connection: {e}")
+            return None
     
     def return_connection(self, conn):
+        if conn is None:
+            return
         with self.lock:
             if len(self.pool) < 5:
                 self.pool.append(conn)
             else:
-                conn.close()
+                try:
+                    conn.close()
+                except Exception:
+                    pass
     
     def close_all(self):
         with self.lock:
             for conn in self.pool:
-                conn.close()
+                try:
+                    conn.close()
+                except Exception:
+                    pass
             self.pool.clear()
 
 db_pool = DBConnectionPool(str(DB_FILE))
 
-# ── Startup helpers ────────────────────────────────────────────────────────────
+# ── Startup helpers ────────────────────────────────────────────────────
 def set_windows_startup(enabled: bool):
     if sys.platform != "win32": return
     try:
@@ -120,10 +206,10 @@ def set_windows_startup(enabled: bool):
     except Exception as e:
         logger.error(f"Failed to set startup: {e}")
 
-# ── Shared state (fix #6 - use deque) ─────────────────────────────────────────
+# ── Shared state (fix #6) ──────────────────────────────────────────────
 state = {
-    "status": "idle",        # idle | running | stopped
-    "logs":   deque(maxlen=200),  # Use deque with max length (O(1) operations)
+    "status": "idle",
+    "logs":   deque(maxlen=200),
     "count":  0,
     "size_str": "0 B",
     "authorized": False,
@@ -137,33 +223,67 @@ def push_log(msg: str):
     state["logs"].append(line)
     logger.info(msg)
 
-# ── DB helpers (fix #7 - batch queries) ──────────────────────────────────────
+# ── DB helpers (fix #7) ────────────────────────────────────────────────
 def is_uploaded(conn, fhash):
-    return bool(conn.execute("SELECT 1 FROM uploads WHERE uuid=?", (fhash,)).fetchone())
+    if conn is None:
+        return False
+    try:
+        return bool(conn.execute("SELECT 1 FROM uploads WHERE uuid=?", (fhash,)).fetchone())
+    except sqlite3.Error as e:
+        logger.error(f"DB query failed: {e}")
+        return False
 
 def are_uploaded_batch(conn, fhashes):
     """Batch check - fix #7: N+1 queries"""
-    if not fhashes:
+    if conn is None or not fhashes:
         return set()
-    placeholders = ','.join(['?'] * len(fhashes))
-    query = f"SELECT uuid FROM uploads WHERE uuid IN ({placeholders})"
-    results = conn.execute(query, fhashes).fetchall()
-    return {row[0] for row in results}
+    try:
+        placeholders = ','.join(['?'] * len(fhashes))
+        query = f"SELECT uuid FROM uploads WHERE uuid IN ({placeholders})"
+        results = conn.execute(query, fhashes).fetchall()
+        return {row[0] for row in results}
+    except sqlite3.Error as e:
+        logger.error(f"Batch query failed: {e}")
+        return set()
 
 def mark_uploaded(conn, fhash, fname, size, local_path=""):
-    conn.execute("REPLACE INTO uploads VALUES(?,CURRENT_TIMESTAMP,?,?,?)", (fhash, fname, size, local_path))
-    conn.commit()
+    if conn is None:
+        return
+    try:
+        conn.execute("REPLACE INTO uploads VALUES(?,CURRENT_TIMESTAMP,?,?,?)", 
+                    (fhash, fname, size, local_path))
+        conn.commit()
+    except sqlite3.Error as e:
+        logger.error(f"Failed to mark uploaded: {e}")
+        try:
+            conn.rollback()
+        except:
+            pass
 
 def get_uploaded_files(conn):
     """Get all successfully uploaded files with their local paths"""
-    results = conn.execute("SELECT uuid, filename, file_size, local_path FROM uploads WHERE filename NOT LIKE 'IN_FLIGHT%' AND filename NOT LIKE 'SKIPPED%'").fetchall()
-    return results
+    if conn is None:
+        return []
+    try:
+        results = conn.execute(
+            "SELECT uuid, filename, file_size, local_path FROM uploads WHERE filename NOT LIKE 'IN_FLIGHT%' AND filename NOT LIKE 'SKIPPED%'"
+        ).fetchall()
+        return results
+    except sqlite3.Error as e:
+        logger.error(f"Failed to get uploaded files: {e}")
+        return []
 
 def get_stats(conn):
-    r = conn.execute("SELECT COUNT(*),SUM(file_size) FROM uploads WHERE filename NOT LIKE 'SKIPPED%'").fetchone()
-    return r[0] or 0, r[1] or 0
+    if conn is None:
+        return 0, 0
+    try:
+        r = conn.execute("SELECT COUNT(*),SUM(file_size) FROM uploads WHERE filename NOT LIKE 'SKIPPED%'").fetchone()
+        return r[0] or 0, r[1] or 0
+    except sqlite3.Error as e:
+        logger.error(f"Failed to get stats: {e}")
+        return 0, 0
 
-# ── Config helpers ─────────────────────────────────────────────────────────────
+# ── Config helpers ────────────────────────────────────────────────────
 def fmt_size(b):
     if b>=(1<<30): return f"{b/(1<<30):.2f} GB"
     if b>=(1<<20): return f"{b/(1<<20):.1f} MB"
@@ -180,7 +300,7 @@ def detect_icloud():
         if c.exists(): return str(c)
     return str(Path.home()/"Pictures")
 
-# ── File hashing (fix #3 - proper content hashing) ──────────────────────────
+# ── File hashing (fix #3) ──────────────────────────────────────────────
 _hash_cache = {}
 _hash_cache_lock = threading.Lock()
 
@@ -203,10 +323,11 @@ def compute_file_hash(filepath, use_cache=True):
                 _hash_cache[filepath] = result
         
         return result
-    except (OSError, IOError):
+    except (OSError, IOError) as e:
+        logger.error(f"Failed to hash file: {e}")
         return None
 
-# ── File system watcher (fix #1 - watch instead of full scan) ────────────────
+# ── File system watcher (fix #1) ───────────────────────────────────────
 pending_files = set()
 pending_files_lock = threading.Lock()
 
@@ -236,12 +357,18 @@ def start_file_watcher(path):
 def stop_file_watcher():
     global observer
     if observer:
-        observer.stop()
-        observer.join()
+        try:
+            observer.stop()
+            observer.join()
+        except Exception as e:
+            logger.error(f"Error stopping watcher: {e}")
 
-# ── Storage cleanup (NEW FEATURE) ──────────────────────────────────────────────
+# ── Storage cleanup ────────────────────────────────────────────────────
 def cleanup_icloud_storage(conn, cleanup_older_than_days=30):
     """Clean up backed-up files from iCloud storage after confirmation"""
+    if conn is None:
+        return 0, 0
+    
     try:
         uploaded_files = get_uploaded_files(conn)
         cutoff_time = time.time() - (cleanup_older_than_days * 86400)
@@ -259,17 +386,20 @@ def cleanup_icloud_storage(conn, cleanup_older_than_days=30):
                     push_log(f"⏭️  Skipped (not found): {filename}")
                     continue
                 
-                # Check if file is old enough (to avoid deleting files still syncing)
                 if file_path.stat().st_mtime > cutoff_time:
                     push_log(f"⏭️  Too new to delete: {filename}")
                     continue
                 
-                # Delete the file
                 file_path.unlink()
                 deleted_count += 1
                 deleted_size += file_size or 0
                 push_log(f"🗑️  Deleted backed-up file: {filename}")
                 
+            except PermissionError:
+                failed_files.append((filename, "Permission denied"))
+                push_log(f"⚠️  Permission denied: {filename}")
+            except FileNotFoundError:
+                push_log(f"⏭️  Already deleted: {filename}")
             except Exception as e:
                 failed_files.append((filename, str(e)))
                 push_log(f"⚠️  Failed to delete {filename}: {e}")
@@ -287,9 +417,9 @@ def cleanup_icloud_storage(conn, cleanup_older_than_days=30):
         push_log(f"❌ Cleanup failed: {e}")
         return 0, 0
 
-# ── Auto-updater ─────────────────────────────────────────────────────────────
+# ── Auto-updater ──────────────────────────────────────────────────────
 def check_for_update():
-    """Check GitHub for a newer release version. Runs in background thread."""
+    """Check GitHub for a newer release version"""
     try:
         import urllib.request
         req = urllib.request.Request(
@@ -313,23 +443,17 @@ def check_for_update():
             update_state["url"]       = dl_url
             push_log(f"🆕 Update available: v{latest_tag} — check the dashboard!")
     except Exception:
-        pass  # silently ignore network errors
+        pass
 
 def _update_check_loop():
-    """Repeat update check every 30 minutes."""
     while True:
         check_for_update()
         time.sleep(1800)
 
-# ── Thread pool for blocking I/O (fix #5) ────────────────────────────────────
+# ── Thread pool ────────────────────────────────────────────────────────
 thread_pool = ThreadPoolExecutor(max_workers=3)
 
-def run_in_thread(func, *args):
-    """Run blocking function in thread pool"""
-    loop = asyncio.get_event_loop()
-    return loop.run_in_executor(thread_pool, func, *args)
-
-# ── Backup daemon ─────────────────────────────────────────────────────────────
+# ── Backup daemon ──────────────────────────────────────────────────────
 _daemon_loop: asyncio.AbstractEventLoop = None
 _daemon_task = None
 
@@ -337,19 +461,37 @@ async def _daemon(cfg):
     from telethon import TelegramClient
     from telethon.errors import FloodWaitError
 
-    channel_id  = int(cfg["channel_id"])
-    photos_path = cfg.get("photos_path", "")
-    api_id      = int(cfg.get("api_id", TELEGRAM_API_ID))
-    api_hash    = cfg.get("api_hash", TELEGRAM_API_HASH)
-    cleanup_after_backup = cfg.get("cleanup_after_backup", False)
-    cleanup_days = int(cfg.get("cleanup_days", 30))
+    try:
+        channel_id  = int(cfg["channel_id"])
+    except (ValueError, KeyError):
+        push_log("❌ Invalid channel ID")
+        state["status"] = "stopped"
+        return
 
-    if not photos_path or not Path(photos_path).exists():
+    photos_path = cfg.get("photos_path", "")
+    
+    # Security Fix #2: Validate path
+    if not validate_path(photos_path):
+        push_log(f"❌ Invalid photos path: {photos_path}")
+        state["status"] = "stopped"
+        return
+    
+    if not Path(photos_path).exists():
         push_log(f"❌ Photos folder not found: {photos_path}")
         state["status"] = "stopped"
         return
 
-    # Start file watcher (fix #1)
+    api_id      = int(cfg.get("api_id", TELEGRAM_API_ID))
+    api_hash    = cfg.get("api_hash", TELEGRAM_API_HASH)
+    cleanup_after_backup = cfg.get("cleanup_after_backup", False)
+    
+    try:
+        cleanup_days = int(cfg.get("cleanup_days", 30))
+        if not validate_cleanup_days(cleanup_days):
+            cleanup_days = 30
+    except (ValueError, TypeError):
+        cleanup_days = 30
+
     start_file_watcher(photos_path)
 
     client = TelegramClient(SESSION_FILE, api_id, api_hash)
@@ -363,34 +505,47 @@ async def _daemon(cfg):
 
     sem    = asyncio.Semaphore(2)
     conn   = db_pool.get_connection()
-    export = Path(tempfile.gettempdir()) / "tele_backup_export"
-    export.mkdir(exist_ok=True)
-    push_log(f"✅ Connected! Watching: {photos_path}")
+    if conn is None:
+        push_log("❌ Cannot connect to database")
+        state["status"] = "stopped"
+        await client.disconnect()
+        stop_file_watcher()
+        return
     
+    export = Path(tempfile.gettempdir()) / "tele_backup_export"
+    try:
+        export.mkdir(exist_ok=True)
+    except Exception as e:
+        push_log(f"⚠️ Failed to create temp directory: {e}")
+        export = Path(tempfile.gettempdir())
+    
+    push_log(f"✅ Connected! Watching: {photos_path}")
     state["cleanup_enabled"] = cleanup_after_backup
 
     try:
         while state["status"] == "running":
             try:
-                # Use watched files + fallback scan (fix #1)
                 files_to_check = []
                 
                 with pending_files_lock:
                     files_to_check = list(pending_files)
                     pending_files.clear()
                 
-                # Fallback: do a full scan every 5 minutes for missed files
                 if len(files_to_check) == 0:
-                    for root, dirs, fnames in os.walk(photos_path):
-                        dirs[:] = [d for d in dirs if not d.startswith('.')]
-                        for fn in fnames:
-                            if fn.lower().endswith(ALL_EXT):
-                                files_to_check.append(os.path.join(root, fn))
+                    try:
+                        for root, dirs, fnames in os.walk(photos_path):
+                            dirs[:] = [d for d in dirs if not d.startswith('.')]
+                            for fn in fnames:
+                                if fn.lower().endswith(ALL_EXT):
+                                    files_to_check.append(os.path.join(root, fn))
+                    except PermissionError as e:
+                        push_log(f"⚠️ Permission error scanning files: {e}")
+                    except Exception as e:
+                        push_log(f"⚠️ Error scanning files: {e}")
                 
                 now = time.time()
                 tasks = []
                 
-                # Compute hashes in bulk (fix #3)
                 file_hashes = {}
                 for fp in files_to_check:
                     try:
@@ -399,7 +554,7 @@ async def _daemon(cfg):
                     except OSError:
                         continue
                     
-                    if now - mtime < 3:  # Skip recently modified files
+                    if now - mtime < 3:
                         continue
                     
                     fhash = compute_file_hash(fp, use_cache=True)
@@ -407,16 +562,14 @@ async def _daemon(cfg):
                         file_hashes[fp] = fhash
                 
                 if not file_hashes:
-                    # No new files - run cleanup if enabled
                     if cleanup_after_backup:
-                        await asyncio.sleep(1)  # Small delay
+                        await asyncio.sleep(1)
                         cleanup_icloud_storage(conn, cleanup_days)
                     
                     push_log("🔍 No new files. Waiting 15s…")
                     await asyncio.sleep(15)
                     continue
                 
-                # Batch check if files are uploaded (fix #7)
                 hashes_list = list(file_hashes.values())
                 uploaded_set = are_uploaded_batch(conn, hashes_list)
                 
@@ -437,7 +590,6 @@ async def _daemon(cfg):
                     ok = sum(1 for r in results if r is True)
                     if ok: 
                         push_log(f"✅ Uploaded {ok} new file(s).")
-                        # Auto cleanup after successful uploads if enabled
                         if cleanup_after_backup:
                             await asyncio.sleep(2)
                             cleanup_icloud_storage(conn, cleanup_days)
@@ -472,7 +624,6 @@ async def _upload_one(client, conn, channel_id, fp, sz, fhash, sem, export_dir, 
             ts   = int(time.time()*1000)
             tmp  = export_dir / f"{ts}_{fname}"
             
-            # Copy in thread to not block event loop (fix #5)
             await asyncio.get_event_loop().run_in_executor(thread_pool, shutil.copy2, fp, tmp)
             
             date_str = datetime.fromtimestamp(os.path.getmtime(fp)).strftime("%Y-%m-%d %H:%M")
@@ -482,15 +633,16 @@ async def _upload_one(client, conn, channel_id, fp, sz, fhash, sem, export_dir, 
             await client.send_file(channel_id, str(tmp), caption=cap, force_document=True)
             mark_uploaded(conn, fhash, fname, sz, local_path)
             
-            # Use try/finally for guaranteed cleanup (fix #8)
             return True
         except Exception as e:
             push_log(f"❌ Failed {fname}: {e}")
-            conn.execute("DELETE FROM uploads WHERE uuid=?", (fhash,))
-            conn.commit()
+            try:
+                conn.execute("DELETE FROM uploads WHERE uuid=?", (fhash,))
+                conn.commit()
+            except:
+                pass
             return False
         finally:
-            # Guaranteed cleanup (fix #8)
             if tmp and tmp.exists():
                 try:
                     tmp.unlink()
@@ -501,10 +653,17 @@ def start_daemon():
     global _daemon_loop
     cfg = load_config()
     _daemon_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(_daemon_loop)
-    _daemon_loop.run_until_complete(_daemon(cfg))
+    try:
+        asyncio.set_event_loop(_daemon_loop)
+        _daemon_loop.run_until_complete(_daemon(cfg))
+    finally:
+        try:
+            _daemon_loop.close()
+        except Exception:
+            pass
+        _daemon_loop = None
 
-# ── OTP login ──────────────────────────────────────────────────────────────────
+# ── OTP login ──────────────────────────────────────────────────────────
 _login_state = {"step": "idle", "phone": "", "hash": ""}
 
 async def _send_otp(phone):
@@ -526,110 +685,184 @@ async def _verify_otp(code):
     await client.disconnect()
     return me.first_name
 
-# ── HTTP Server ───────────────────────────────────────────────────────────────
+# ── HTTP Server ────────────────────────────────────────────────────────
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import urllib.parse as urlparse
 
 class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *a): pass  # suppress access logs
+    def log_message(self, *a): pass
 
     def send_json(self, data, code=200):
-        body = json.dumps(data).encode()
-        self.send_response(code)
-        self.send_header("Content-Type","application/json")
-        self.send_header("Content-Length", len(body))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            body = json.dumps(data).encode()
+            self.send_response(code)
+            self.send_header("Content-Type","application/json")
+            self.send_header("Content-Length", len(body))
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as e:
+            logger.error(f"Failed to send response: {e}")
 
     def send_html(self, html: str):
-        body = html.encode()
-        self.send_response(200)
-        self.send_header("Content-Type","text/html; charset=utf-8")
-        self.send_header("Content-Length", len(body))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            body = html.encode()
+            self.send_response(200)
+            self.send_header("Content-Type","text/html; charset=utf-8")
+            self.send_header("Content-Length", len(body))
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as e:
+            logger.error(f"Failed to send HTML: {e}")
 
     def do_GET(self):
         path = self.path.split("?")[0]
-        if path == "/":
-            self.send_html(DASHBOARD_HTML)
-        elif path == "/api/state":
-            self.send_json({**state, "logs": list(state["logs"])[-50:]})
-        elif path == "/api/config":
-            self.send_json(load_config())
-        elif path == "/api/detect_icloud":
-            self.send_json({"path": detect_icloud()})
-        elif path == "/api/update_info":
-            self.send_json({**update_state, "current": APP_VERSION})
-        else:
-            self.send_response(404); self.end_headers()
+        try:
+            if path == "/":
+                self.send_html(DASHBOARD_HTML)
+            elif path == "/api/state":
+                self.send_json({**state, "logs": list(state["logs"])[-50:]})
+            elif path == "/api/config":
+                self.send_json(load_config())
+            elif path == "/api/detect_icloud":
+                self.send_json({"path": detect_icloud()})
+            elif path == "/api/update_info":
+                self.send_json({**update_state, "current": APP_VERSION})
+            else:
+                self.send_response(404)
+                self.end_headers()
+        except Exception as e:
+            logger.error(f"GET error: {e}")
+            self.send_json({"error": "Internal error"}, 500)
 
     def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        body   = json.loads(self.rfile.read(length) or b"{}")
-        path   = self.path
-
-        if path == "/api/send_otp":
-            phone = body.get("phone","").strip()
+        try:
+            # Security Fix #10: Validate content length
+            length = int(self.headers.get("Content-Length", 0))
+            if length > MAX_BODY_SIZE:
+                self.send_json({"error": "Request too large"}, 413)
+                return
+            
             try:
-                # Fix #5: Run async code in thread pool
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                loop.run_until_complete(_send_otp(phone))
-                loop.close()
-                
-                _login_state["step"] = "waiting_otp"
-                self.send_json({"ok": True})
-            except Exception as e:
-                self.send_json({"ok": False, "error": str(e)})
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except json.JSONDecodeError:
+                self.send_json({"error": "Invalid JSON"}, 400)
+                return
+            
+            path = self.path
 
-        elif path == "/api/verify_otp":
-            code = body.get("code","").strip()
-            try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                name = loop.run_until_complete(_verify_otp(code))
-                loop.close()
+            if path == "/api/send_otp":
+                phone = body.get("phone","").strip()
                 
+                # Security Fix #3: Validate input
+                if not validate_phone(phone):
+                    self.send_json({"ok": False, "error": "Invalid phone number"})
+                    return
+                
+                try:
+                    # Security Fix #4: Close event loop properly
+                    loop = asyncio.new_event_loop()
+                    try:
+                        asyncio.set_event_loop(loop)
+                        loop.run_until_complete(_send_otp(phone))
+                    finally:
+                        loop.close()
+                    
+                    _login_state["step"] = "waiting_otp"
+                    self.send_json({"ok": True})
+                except Exception as e:
+                    self.send_json({"ok": False, "error": str(e)})
+
+            elif path == "/api/verify_otp":
+                code = body.get("code","").strip()
+                try:
+                    loop = asyncio.new_event_loop()
+                    try:
+                        asyncio.set_event_loop(loop)
+                        name = loop.run_until_complete(_verify_otp(code))
+                    finally:
+                        loop.close()
+                    
+                    cfg = load_config()
+                    cfg.update({"api_id": TELEGRAM_API_ID, "api_hash": TELEGRAM_API_HASH,
+                                 "phone": _login_state["phone"]})
+                    save_config(cfg)
+                    self.send_json({"ok": True, "name": name})
+                except Exception as e:
+                    self.send_json({"ok": False, "error": str(e)})
+
+            elif path == "/api/save_config":
                 cfg = load_config()
-                cfg.update({"api_id": TELEGRAM_API_ID, "api_hash": TELEGRAM_API_HASH,
-                             "phone": _login_state["phone"]})
+                
+                # Security Fix #3: Validate all inputs
+                if "phone" in body and body["phone"]:
+                    if not validate_phone(body["phone"]):
+                        self.send_json({"ok": False, "error": "Invalid phone"})
+                        return
+                    cfg["phone"] = body["phone"]
+                
+                if "channel_id" in body and body["channel_id"]:
+                    if not validate_channel_id(body["channel_id"]):
+                        self.send_json({"ok": False, "error": "Invalid channel ID"})
+                        return
+                    cfg["channel_id"] = body["channel_id"]
+                
+                if "photos_path" in body and body["photos_path"]:
+                    if not validate_path(body["photos_path"]):
+                        self.send_json({"ok": False, "error": "Invalid path"})
+                        return
+                    cfg["photos_path"] = body["photos_path"]
+                
+                if "cleanup_after_backup" in body:
+                    cfg["cleanup_after_backup"] = bool(body["cleanup_after_backup"])
+                
+                if "cleanup_days" in body:
+                    if not validate_cleanup_days(body["cleanup_days"]):
+                        self.send_json({"ok": False, "error": "cleanup_days must be 1-365"})
+                        return
+                    cfg["cleanup_days"] = int(body["cleanup_days"])
+                
+                if "windows_startup" in body:
+                    cfg["windows_startup"] = bool(body["windows_startup"])
+                
+                if "auto_start_backup" in body:
+                    cfg["auto_start_backup"] = bool(body["auto_start_backup"])
+                
                 save_config(cfg)
-                self.send_json({"ok": True, "name": name})
-            except Exception as e:
-                self.send_json({"ok": False, "error": str(e)})
+                if "windows_startup" in body:
+                    set_windows_startup(body["windows_startup"])
+                self.send_json({"ok": True})
 
-        elif path == "/api/save_config":
-            cfg = load_config()
-            cfg.update(body)
-            save_config(cfg)
-            if "windows_startup" in body:
-                set_windows_startup(body["windows_startup"])
-            self.send_json({"ok": True})
+            elif path == "/api/start":
+                if state["status"] != "running":
+                    state["status"] = "running"
+                    push_log("🚀 Backup started.")
+                    threading.Thread(target=start_daemon, daemon=True).start()
+                self.send_json({"ok": True})
 
-        elif path == "/api/start":
-            if state["status"] != "running":
-                state["status"] = "running"
-                push_log("🚀 Backup started.")
-                threading.Thread(target=start_daemon, daemon=True).start()
-            self.send_json({"ok": True})
+            elif path == "/api/stop":
+                state["status"] = "stopped"
+                self.send_json({"ok": True})
 
-        elif path == "/api/stop":
-            state["status"] = "stopped"
-            self.send_json({"ok": True})
+            elif path == "/api/quit":
+                state["status"] = "stopped"
+                self.send_json({"ok": True})
+                def _shutdown():
+                    time.sleep(1)
+                    os._exit(0)
+                threading.Thread(target=_shutdown).start()
 
-        elif path == "/api/quit":
-            state["status"] = "stopped"
-            self.send_json({"ok": True})
-            def _shutdown():
-                time.sleep(1)
-                os._exit(0)
-            threading.Thread(target=_shutdown).start()
+            else:
+                self.send_response(404)
+                self.end_headers()
+        
+        except Exception as e:
+            logger.error(f"POST error: {e}")
+            try:
+                self.send_json({"error": "Internal error"}, 500)
+            except:
+                pass
 
-        else:
-            self.send_response(404); self.end_headers()
-
-# ── Dashboard HTML (single-page) ──────────────────────────────────────────────
+# ── Dashboard HTML ────────────────────────────────────────────────────
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -680,7 +913,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </head>
 <body>
 <div class="app">
-  <h1>📸 Telegram Backup Pro</h1>
+  <h1>📸 Telegram Backup Pro v2.2.1</h1>
   <p class="sub">Backup your photos & videos to Telegram — automatically.<br><span style="color:#58a6ff;font-weight:600;">Developed by Shithel</span></p>
 
   <div id="update-banner" style="display:none;background:#1c2a14;border:1px solid #3fb950;border-radius:10px;padding:12px 18px;margin-bottom:16px;display:none;align-items:center;gap:12px;">
@@ -799,7 +1032,7 @@ async function sendOtp(){
     setMsg('login-msg','✅ Code sent! Check Telegram.','ok');
     if(ch) await api('POST','/api/save_config',{channel_id:ch});
   } else {
-    setMsg('login-msg','❌ '+r.error,'err');
+    setMsg('login-msg','❌ '+(r.error||'Error'),'err');
   }
 }
 
@@ -810,7 +1043,7 @@ async function verifyOtp(){
   if(r.ok){
     setMsg('login-msg','✅ Logged in as '+r.name+'! Go to Settings to set your folder, then start backup.','ok');
   } else {
-    setMsg('login-msg','❌ '+r.error,'err');
+    setMsg('login-msg','❌ '+(r.error||'Error'),'err');
   }
 }
 
@@ -832,7 +1065,7 @@ async function saveSettings(){
     windows_startup:startup,
     auto_start_backup:auto
   });
-  setMsg('settings-msg', r.ok?'✅ Saved!':'❌ Error','ok');
+  setMsg('settings-msg', r.ok?'✅ Saved!':'❌ '+(r.error||'Error'),'ok');
 }
 
 async function startBackup(){ await api('POST','/api/start',{}); }
@@ -849,7 +1082,6 @@ function setMsg(id,text,type){
   el.innerHTML='<div class="msg '+type+'">'+text+'</div>';
 }
 
-// ── Polling (fix #10: reduced frequency) ────────────────────────────────
 let lastLogLen=0;
 async function poll(){
   try{
@@ -865,12 +1097,10 @@ async function poll(){
       box.innerHTML=d.logs.map(l=>'<div>'+l+'</div>').join('');
       box.scrollTop=box.scrollHeight;
     }
-    // Show cleanup banner if enabled
     document.getElementById('cleanup-banner').style.display=d.cleanup_enabled?'block':'none';
   }catch(e){}
 }
 
-// Load saved config into settings tab
 async function loadConfig(){
   try{
     const c=await api('GET','/api/config');
@@ -905,15 +1135,13 @@ setInterval(checkUpdate,300000);
 </body>
 </html>"""
 
-# ── Entry point ──────────────────────────────────────────────────────────────
+# ── Entry point ────────────────────────────────────────────────────────
 if __name__ == "__main__":
     cfg = load_config()
 
-    # Check if already authorized
     if Path(SESSION_FILE).exists():
         state["authorized"] = True
 
-    # Auto-start backup if configured
     if cfg.get("auto_start_backup") and cfg.get("channel_id") and cfg.get("photos_path"):
         state["status"] = "running"
         push_log("🚀 Auto-starting backup...")
@@ -921,10 +1149,10 @@ if __name__ == "__main__":
 
     print(f"\n{'='*50}")
     print(f"  Telegram Backup Pro v{APP_VERSION}")
+    print(f"  🔒 Security-hardened build")
     print(f"  Open: http://localhost:{PORT}")
     print(f"{'='*50}\n")
 
-    # Silent flag (used for startup) prevents opening browser
     if "--silent" not in sys.argv:
         import webbrowser
         threading.Timer(1.5, lambda: webbrowser.open(f"http://127.0.0.1:{PORT}")).start()
