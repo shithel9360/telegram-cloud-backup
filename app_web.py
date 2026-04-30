@@ -24,7 +24,7 @@ PORT         = 7878
 TELEGRAM_API_ID   = 36355055
 TELEGRAM_API_HASH = "9b819327f0403ce37b08e316a8464cb6"
 
-APP_VERSION  = "2.1.0"          # bumped on every release
+APP_VERSION  = "2.2.0"          # bumped on every release
 GITHUB_REPO  = "shithel9360/telegram-cloud-backup"
 RELEASES_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -77,7 +77,7 @@ class DBConnectionPool:
         conn = self.pool[0]
         conn.execute("""CREATE TABLE IF NOT EXISTS uploads (
             uuid TEXT PRIMARY KEY, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            filename TEXT, file_size INTEGER DEFAULT 0)""")
+            filename TEXT, file_size INTEGER DEFAULT 0, local_path TEXT)""")
         conn.commit()
     
     def get_connection(self):
@@ -101,7 +101,7 @@ class DBConnectionPool:
 
 db_pool = DBConnectionPool(str(DB_FILE))
 
-# ── Startup helpers ───────────────────────────────────────────────────────────
+# ── Startup helpers ────────────────────────────────────────────────────────────
 def set_windows_startup(enabled: bool):
     if sys.platform != "win32": return
     try:
@@ -127,6 +127,8 @@ state = {
     "count":  0,
     "size_str": "0 B",
     "authorized": False,
+    "cleanup_enabled": False,
+    "cleanup_count": 0,
 }
 
 def push_log(msg: str):
@@ -148,15 +150,20 @@ def are_uploaded_batch(conn, fhashes):
     results = conn.execute(query, fhashes).fetchall()
     return {row[0] for row in results}
 
-def mark_uploaded(conn, fhash, fname, size):
-    conn.execute("REPLACE INTO uploads VALUES(?,CURRENT_TIMESTAMP,?,?)", (fhash, fname, size))
+def mark_uploaded(conn, fhash, fname, size, local_path=""):
+    conn.execute("REPLACE INTO uploads VALUES(?,CURRENT_TIMESTAMP,?,?,?)", (fhash, fname, size, local_path))
     conn.commit()
+
+def get_uploaded_files(conn):
+    """Get all successfully uploaded files with their local paths"""
+    results = conn.execute("SELECT uuid, filename, file_size, local_path FROM uploads WHERE filename NOT LIKE 'IN_FLIGHT%' AND filename NOT LIKE 'SKIPPED%'").fetchall()
+    return results
 
 def get_stats(conn):
     r = conn.execute("SELECT COUNT(*),SUM(file_size) FROM uploads WHERE filename NOT LIKE 'SKIPPED%'").fetchone()
     return r[0] or 0, r[1] or 0
 
-# ── Config helpers ────────────────────────────────────────────────────────────
+# ── Config helpers ─────────────────────────────────────────────────────────────
 def fmt_size(b):
     if b>=(1<<30): return f"{b/(1<<30):.2f} GB"
     if b>=(1<<20): return f"{b/(1<<20):.1f} MB"
@@ -232,6 +239,54 @@ def stop_file_watcher():
         observer.stop()
         observer.join()
 
+# ── Storage cleanup (NEW FEATURE) ──────────────────────────────────────────────
+def cleanup_icloud_storage(conn, cleanup_older_than_days=30):
+    """Clean up backed-up files from iCloud storage after confirmation"""
+    try:
+        uploaded_files = get_uploaded_files(conn)
+        cutoff_time = time.time() - (cleanup_older_than_days * 86400)
+        deleted_count = 0
+        deleted_size = 0
+        failed_files = []
+        
+        for uuid, filename, file_size, local_path in uploaded_files:
+            if not local_path:
+                continue
+            
+            try:
+                file_path = Path(local_path)
+                if not file_path.exists():
+                    push_log(f"⏭️  Skipped (not found): {filename}")
+                    continue
+                
+                # Check if file is old enough (to avoid deleting files still syncing)
+                if file_path.stat().st_mtime > cutoff_time:
+                    push_log(f"⏭️  Too new to delete: {filename}")
+                    continue
+                
+                # Delete the file
+                file_path.unlink()
+                deleted_count += 1
+                deleted_size += file_size or 0
+                push_log(f"🗑️  Deleted backed-up file: {filename}")
+                
+            except Exception as e:
+                failed_files.append((filename, str(e)))
+                push_log(f"⚠️  Failed to delete {filename}: {e}")
+        
+        if deleted_count > 0:
+            push_log(f"✅ Cleanup complete: {deleted_count} files deleted ({fmt_size(deleted_size)})")
+            state["cleanup_count"] += deleted_count
+        
+        if failed_files:
+            push_log(f"⚠️  {len(failed_files)} files could not be deleted")
+        
+        return deleted_count, deleted_size
+    
+    except Exception as e:
+        push_log(f"❌ Cleanup failed: {e}")
+        return 0, 0
+
 # ── Auto-updater ─────────────────────────────────────────────────────────────
 def check_for_update():
     """Check GitHub for a newer release version. Runs in background thread."""
@@ -286,6 +341,8 @@ async def _daemon(cfg):
     photos_path = cfg.get("photos_path", "")
     api_id      = int(cfg.get("api_id", TELEGRAM_API_ID))
     api_hash    = cfg.get("api_hash", TELEGRAM_API_HASH)
+    cleanup_after_backup = cfg.get("cleanup_after_backup", False)
+    cleanup_days = int(cfg.get("cleanup_days", 30))
 
     if not photos_path or not Path(photos_path).exists():
         push_log(f"❌ Photos folder not found: {photos_path}")
@@ -309,6 +366,8 @@ async def _daemon(cfg):
     export = Path(tempfile.gettempdir()) / "tele_backup_export"
     export.mkdir(exist_ok=True)
     push_log(f"✅ Connected! Watching: {photos_path}")
+    
+    state["cleanup_enabled"] = cleanup_after_backup
 
     try:
         while state["status"] == "running":
@@ -348,6 +407,11 @@ async def _daemon(cfg):
                         file_hashes[fp] = fhash
                 
                 if not file_hashes:
+                    # No new files - run cleanup if enabled
+                    if cleanup_after_backup:
+                        await asyncio.sleep(1)  # Small delay
+                        cleanup_icloud_storage(conn, cleanup_days)
+                    
                     push_log("🔍 No new files. Waiting 15s…")
                     await asyncio.sleep(15)
                     continue
@@ -366,12 +430,17 @@ async def _daemon(cfg):
                         continue
                     
                     fname = os.path.basename(fp)
-                    tasks.append(_upload_one(client, conn, channel_id, fp, sz, fhash, sem, export, cfg.get("delete_after", False)))
+                    tasks.append(_upload_one(client, conn, channel_id, fp, sz, fhash, sem, export, fp))
 
                 if tasks:
                     results = await asyncio.gather(*tasks, return_exceptions=True)
                     ok = sum(1 for r in results if r is True)
-                    if ok: push_log(f"✅ Uploaded {ok} new file(s).")
+                    if ok: 
+                        push_log(f"✅ Uploaded {ok} new file(s).")
+                        # Auto cleanup after successful uploads if enabled
+                        if cleanup_after_backup:
+                            await asyncio.sleep(2)
+                            cleanup_icloud_storage(conn, cleanup_days)
                 
                 cnt, raw = get_stats(conn)
                 state["count"]    = cnt
@@ -391,12 +460,12 @@ async def _daemon(cfg):
         stop_file_watcher()
         push_log("🛑 Daemon stopped.")
 
-async def _upload_one(client, conn, channel_id, fp, sz, fhash, sem, export_dir, delete_after=False):
+async def _upload_one(client, conn, channel_id, fp, sz, fhash, sem, export_dir, local_path=""):
     fname = os.path.basename(fp)
     if is_uploaded(conn, fhash):
         return False
     
-    mark_uploaded(conn, fhash, f"IN_FLIGHT_{fname}", sz)
+    mark_uploaded(conn, fhash, f"IN_FLIGHT_{fname}", sz, local_path)
     tmp = None
     async with sem:
         try:
@@ -411,7 +480,7 @@ async def _upload_one(client, conn, channel_id, fp, sz, fhash, sem, export_dir, 
             cap  = f"📁 {fname}\n📅 {date_str}\n🏷 {ext}  •  {fmt_size(sz)}"
             push_log(f"⬆️  Uploading {fname}…")
             await client.send_file(channel_id, str(tmp), caption=cap, force_document=True)
-            mark_uploaded(conn, fhash, fname, sz)
+            mark_uploaded(conn, fhash, fname, sz, local_path)
             
             # Use try/finally for guaranteed cleanup (fix #8)
             return True
@@ -435,7 +504,7 @@ def start_daemon():
     asyncio.set_event_loop(_daemon_loop)
     _daemon_loop.run_until_complete(_daemon(cfg))
 
-# ── OTP login ─────────────────────────────────────────────────────────────────
+# ── OTP login ──────────────────────────────────────────────────────────────────
 _login_state = {"step": "idle", "phone": "", "hash": ""}
 
 async def _send_otp(phone):
@@ -606,6 +675,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .msg{padding:10px 14px;border-radius:8px;margin-top:10px;font-size:.875rem}
   .msg.ok{background:#1a4720;color:#3fb950}
   .msg.err{background:#3d1a1a;color:#f85149}
+  .info-row{background:#0d1117;padding:8px 12px;border-left:3px solid #58a6ff;margin:10px 0;font-size:.85rem}
 </style>
 </head>
 <body>
@@ -631,6 +701,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="stat"><div class="val" id="s-count">0</div><div class="key">Files Backed Up</div></div>
       <div class="stat"><div class="val" id="s-size">0 B</div><div class="key">Total Size</div></div>
       <div class="stat"><div class="val"><span class="badge idle" id="s-status">Idle</span></div><div class="key">Status</div></div>
+    </div>
+    <div id="cleanup-banner" style="display:none;background:#1a3d1a;border:1px solid #3fb950;border-radius:10px;padding:12px 18px;margin-bottom:16px;">
+      <span style="font-size:.9rem;color:#3fb950">✅ Storage cleanup enabled - Backed-up files will be automatically deleted after <span id="cleanup-days">30</span> days</span>
     </div>
     <div class="card">
       <h2>Controls</h2>
@@ -675,11 +748,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </div>
       <div class="row" style="margin-top:16px;">
         <label style="min-width:auto;cursor:pointer;">
-          <input type="checkbox" id="delete_after" style="min-width:auto;margin-right:8px;vertical-align:middle;">
-          Delete local files after successful upload (Free up iCloud/Disk space)
+          <input type="checkbox" id="cleanup_after_backup" style="min-width:auto;margin-right:8px;vertical-align:middle;">
+          🗑️ Auto-cleanup: Delete backed-up files from iCloud (frees up storage)
         </label>
       </div>
-      <div class="row" style="margin-top:8px;">
+      <div class="row" style="margin-top:8px;align-items:flex-start;">
+        <label>Days before deletion</label>
+        <input id="cleanup_days" type="number" min="1" max="365" value="30" style="max-width:100px;" />
+        <span style="color:#8b949e;font-size:.8rem;margin-left:8px;">Files older than this will be deleted</span>
+      </div>
+      <div class="row" style="margin-top:16px;">
         <label style="min-width:auto;cursor:pointer;">
           <input type="checkbox" id="windows_startup" style="min-width:auto;margin-right:8px;vertical-align:middle;">
           Start app automatically when Windows boots
@@ -743,12 +821,14 @@ async function detectiCloud(){
 
 async function saveSettings(){
   const path=document.getElementById('photos_path').value.trim();
-  const del=document.getElementById('delete_after').checked;
+  const cleanup=document.getElementById('cleanup_after_backup').checked;
+  const cleanup_days=parseInt(document.getElementById('cleanup_days').value) || 30;
   const startup=document.getElementById('windows_startup').checked;
   const auto=document.getElementById('auto_start_backup').checked;
   const r=await api('POST','/api/save_config',{
     photos_path:path, 
-    delete_after:del,
+    cleanup_after_backup:cleanup,
+    cleanup_days:cleanup_days,
     windows_startup:startup,
     auto_start_backup:auto
   });
@@ -785,6 +865,8 @@ async function poll(){
       box.innerHTML=d.logs.map(l=>'<div>'+l+'</div>').join('');
       box.scrollTop=box.scrollHeight;
     }
+    // Show cleanup banner if enabled
+    document.getElementById('cleanup-banner').style.display=d.cleanup_enabled?'block':'none';
   }catch(e){}
 }
 
@@ -795,7 +877,8 @@ async function loadConfig(){
     if(c.phone) document.getElementById('phone').value=c.phone;
     if(c.channel_id) document.getElementById('channel_id').value=c.channel_id;
     if(c.photos_path) document.getElementById('photos_path').value=c.photos_path;
-    if(c.delete_after) document.getElementById('delete_after').checked=true;
+    if(c.cleanup_after_backup) document.getElementById('cleanup_after_backup').checked=true;
+    if(c.cleanup_days) document.getElementById('cleanup_days').value=c.cleanup_days;
     if(c.windows_startup) document.getElementById('windows_startup').checked=true;
     if(c.auto_start_backup) document.getElementById('auto_start_backup').checked=true;
   }catch(e){}
@@ -822,7 +905,7 @@ setInterval(checkUpdate,300000);
 </body>
 </html>"""
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── Entry point ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     cfg = load_config()
 
