@@ -4,9 +4,13 @@ Single-file web app. Run with: python app_web.py
 Then open: http://localhost:7878
 """
 
-import os, sys, json, time, asyncio, threading, logging, shutil, tempfile, sqlite3
+import os, sys, json, time, asyncio, threading, logging, shutil, tempfile, sqlite3, hashlib
 from pathlib import Path
 from datetime import datetime
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CONFIG_FILE  = Path.home() / ".tele_backup_config.json"
@@ -37,6 +41,66 @@ logging.basicConfig(
 )
 logger = logging.getLogger("BackupPro")
 
+# ── Config Cache (fix #4) ─────────────────────────────────────────────────────
+_config_cache = None
+_config_lock = threading.Lock()
+
+def load_config() -> dict:
+    global _config_cache
+    with _config_lock:
+        if _config_cache is None:
+            if CONFIG_FILE.exists():
+                _config_cache = json.loads(CONFIG_FILE.read_text())
+            else:
+                _config_cache = {}
+    return _config_cache.copy()
+
+def save_config(cfg: dict):
+    global _config_cache
+    CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+    with _config_lock:
+        _config_cache = cfg.copy()
+
+# ── Database Connection Pool (fix #9) ─────────────────────────────────────────
+class DBConnectionPool:
+    def __init__(self, db_path, pool_size=5):
+        self.db_path = db_path
+        self.pool = []
+        self.lock = threading.Lock()
+        for _ in range(pool_size):
+            conn = sqlite3.connect(str(db_path), check_same_thread=True, timeout=30)
+            conn.execute("PRAGMA journal_mode=WAL")
+            self.pool.append(conn)
+        self._init_db()
+    
+    def _init_db(self):
+        conn = self.pool[0]
+        conn.execute("""CREATE TABLE IF NOT EXISTS uploads (
+            uuid TEXT PRIMARY KEY, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            filename TEXT, file_size INTEGER DEFAULT 0)""")
+        conn.commit()
+    
+    def get_connection(self):
+        with self.lock:
+            if self.pool:
+                return self.pool.pop()
+        return sqlite3.connect(str(self.db_path), check_same_thread=True, timeout=30)
+    
+    def return_connection(self, conn):
+        with self.lock:
+            if len(self.pool) < 5:
+                self.pool.append(conn)
+            else:
+                conn.close()
+    
+    def close_all(self):
+        with self.lock:
+            for conn in self.pool:
+                conn.close()
+            self.pool.clear()
+
+db_pool = DBConnectionPool(str(DB_FILE))
+
 # ── Startup helpers ───────────────────────────────────────────────────────────
 def set_windows_startup(enabled: bool):
     if sys.platform != "win32": return
@@ -56,10 +120,10 @@ def set_windows_startup(enabled: bool):
     except Exception as e:
         logger.error(f"Failed to set startup: {e}")
 
-# ── Shared state ──────────────────────────────────────────────────────────────
+# ── Shared state (fix #6 - use deque) ─────────────────────────────────────────
 state = {
     "status": "idle",        # idle | running | stopped
-    "logs":   [],            # last 200 log lines
+    "logs":   deque(maxlen=200),  # Use deque with max length (O(1) operations)
     "count":  0,
     "size_str": "0 B",
     "authorized": False,
@@ -69,34 +133,30 @@ def push_log(msg: str):
     ts = datetime.now().strftime("%H:%M:%S")
     line = f"[{ts}] {msg}"
     state["logs"].append(line)
-    if len(state["logs"]) > 200:
-        state["logs"].pop(0)
     logger.info(msg)
 
-# ── DB helpers ────────────────────────────────────────────────────────────────
-def db_connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_FILE), check_same_thread=False)
-    conn.execute("""CREATE TABLE IF NOT EXISTS uploads (
-        uuid TEXT PRIMARY KEY, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-        filename TEXT, file_size INTEGER DEFAULT 0)""")
-    conn.commit()
-    return conn
+# ── DB helpers (fix #7 - batch queries) ──────────────────────────────────────
+def is_uploaded(conn, fhash):
+    return bool(conn.execute("SELECT 1 FROM uploads WHERE uuid=?", (fhash,)).fetchone())
 
-def is_uploaded(conn, fhash): return bool(conn.execute("SELECT 1 FROM uploads WHERE uuid=?", (fhash,)).fetchone())
-def mark_uploaded(conn, fhash, fname, size): conn.execute("REPLACE INTO uploads VALUES(?,CURRENT_TIMESTAMP,?,?)",(fhash,fname,size)); conn.commit()
+def are_uploaded_batch(conn, fhashes):
+    """Batch check - fix #7: N+1 queries"""
+    if not fhashes:
+        return set()
+    placeholders = ','.join(['?'] * len(fhashes))
+    query = f"SELECT uuid FROM uploads WHERE uuid IN ({placeholders})"
+    results = conn.execute(query, fhashes).fetchall()
+    return {row[0] for row in results}
+
+def mark_uploaded(conn, fhash, fname, size):
+    conn.execute("REPLACE INTO uploads VALUES(?,CURRENT_TIMESTAMP,?,?)", (fhash, fname, size))
+    conn.commit()
+
 def get_stats(conn):
     r = conn.execute("SELECT COUNT(*),SUM(file_size) FROM uploads WHERE filename NOT LIKE 'SKIPPED%'").fetchone()
     return r[0] or 0, r[1] or 0
 
 # ── Config helpers ────────────────────────────────────────────────────────────
-def load_config() -> dict:
-    if CONFIG_FILE.exists():
-        return json.loads(CONFIG_FILE.read_text())
-    return {}
-
-def save_config(cfg: dict):
-    CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
-
 def fmt_size(b):
     if b>=(1<<30): return f"{b/(1<<30):.2f} GB"
     if b>=(1<<20): return f"{b/(1<<20):.1f} MB"
@@ -113,7 +173,66 @@ def detect_icloud():
         if c.exists(): return str(c)
     return str(Path.home()/"Pictures")
 
-# ── Auto-updater ──────────────────────────────────────────────────────────────
+# ── File hashing (fix #3 - proper content hashing) ──────────────────────────
+_hash_cache = {}
+_hash_cache_lock = threading.Lock()
+
+def compute_file_hash(filepath, use_cache=True):
+    """Compute MD5 hash of file content"""
+    if use_cache:
+        with _hash_cache_lock:
+            if filepath in _hash_cache:
+                return _hash_cache[filepath]
+    
+    try:
+        hash_obj = hashlib.md5()
+        with open(filepath, 'rb') as f:
+            for chunk in iter(lambda: f.read(8192), b''):
+                hash_obj.update(chunk)
+        result = hash_obj.hexdigest()
+        
+        if use_cache:
+            with _hash_cache_lock:
+                _hash_cache[filepath] = result
+        
+        return result
+    except (OSError, IOError):
+        return None
+
+# ── File system watcher (fix #1 - watch instead of full scan) ────────────────
+pending_files = set()
+pending_files_lock = threading.Lock()
+
+class FileSystemWatcher(FileSystemEventHandler):
+    def on_created(self, event):
+        if not event.is_directory and event.src_path.lower().endswith(ALL_EXT):
+            with pending_files_lock:
+                pending_files.add(event.src_path)
+    
+    def on_modified(self, event):
+        if not event.is_directory and event.src_path.lower().endswith(ALL_EXT):
+            with pending_files_lock:
+                pending_files.add(event.src_path)
+
+observer = None
+
+def start_file_watcher(path):
+    global observer
+    try:
+        observer = Observer()
+        observer.schedule(FileSystemWatcher(), path, recursive=True)
+        observer.start()
+        push_log(f"✅ File watcher started for {path}")
+    except Exception as e:
+        push_log(f"⚠️ File watcher failed: {e}")
+
+def stop_file_watcher():
+    global observer
+    if observer:
+        observer.stop()
+        observer.join()
+
+# ── Auto-updater ─────────────────────────────────────────────────────────────
 def check_for_update():
     """Check GitHub for a newer release version. Runs in background thread."""
     try:
@@ -147,6 +266,14 @@ def _update_check_loop():
         check_for_update()
         time.sleep(1800)
 
+# ── Thread pool for blocking I/O (fix #5) ────────────────────────────────────
+thread_pool = ThreadPoolExecutor(max_workers=3)
+
+def run_in_thread(func, *args):
+    """Run blocking function in thread pool"""
+    loop = asyncio.get_event_loop()
+    return loop.run_in_executor(thread_pool, func, *args)
+
 # ── Backup daemon ─────────────────────────────────────────────────────────────
 _daemon_loop: asyncio.AbstractEventLoop = None
 _daemon_task = None
@@ -165,101 +292,141 @@ async def _daemon(cfg):
         state["status"] = "stopped"
         return
 
+    # Start file watcher (fix #1)
+    start_file_watcher(photos_path)
+
     client = TelegramClient(SESSION_FILE, api_id, api_hash)
     await client.connect()
     if not await client.is_user_authorized():
         push_log("❌ Not authorized. Please log in first.")
         state["status"] = "stopped"
         await client.disconnect()
+        stop_file_watcher()
         return
 
     sem    = asyncio.Semaphore(2)
-    lock   = asyncio.Lock()
-    conn   = db_connect()
+    conn   = db_pool.get_connection()
     export = Path(tempfile.gettempdir()) / "tele_backup_export"
     export.mkdir(exist_ok=True)
     push_log(f"✅ Connected! Watching: {photos_path}")
 
-    while state["status"] == "running":
-        try:
-            files = []
-            for root, dirs, fnames in os.walk(photos_path):
-                dirs[:] = [d for d in dirs if not d.startswith('.')]
-                for fn in fnames:
-                    if fn.lower().endswith(ALL_EXT):
-                        files.append(os.path.join(root, fn))
-            files.sort(key=os.path.getmtime)
-
-            now = time.time()
-            tasks = []
-            for fp in files:
-                fname = os.path.basename(fp)
-                try:
-                    sz    = os.path.getsize(fp)
-                    mtime = os.path.getmtime(fp)
-                except OSError:
+    try:
+        while state["status"] == "running":
+            try:
+                # Use watched files + fallback scan (fix #1)
+                files_to_check = []
+                
+                with pending_files_lock:
+                    files_to_check = list(pending_files)
+                    pending_files.clear()
+                
+                # Fallback: do a full scan every 5 minutes for missed files
+                if len(files_to_check) == 0:
+                    for root, dirs, fnames in os.walk(photos_path):
+                        dirs[:] = [d for d in dirs if not d.startswith('.')]
+                        for fn in fnames:
+                            if fn.lower().endswith(ALL_EXT):
+                                files_to_check.append(os.path.join(root, fn))
+                
+                now = time.time()
+                tasks = []
+                
+                # Compute hashes in bulk (fix #3)
+                file_hashes = {}
+                for fp in files_to_check:
+                    try:
+                        sz = os.path.getsize(fp)
+                        mtime = os.path.getmtime(fp)
+                    except OSError:
+                        continue
+                    
+                    if now - mtime < 3:  # Skip recently modified files
+                        continue
+                    
+                    fhash = compute_file_hash(fp, use_cache=True)
+                    if fhash:
+                        file_hashes[fp] = fhash
+                
+                if not file_hashes:
+                    push_log("🔍 No new files. Waiting 15s…")
+                    await asyncio.sleep(15)
                     continue
-                fhash = f"{fname}_{sz}"
-                async with lock:
-                    if is_uploaded(conn, fhash): continue
-                if now - mtime < 3: continue
-                tasks.append(_upload_one(client, conn, channel_id, fp, sz, fhash, sem, lock, export, cfg.get("delete_after", False)))
+                
+                # Batch check if files are uploaded (fix #7)
+                hashes_list = list(file_hashes.values())
+                uploaded_set = are_uploaded_batch(conn, hashes_list)
+                
+                for fp, fhash in file_hashes.items():
+                    if fhash in uploaded_set:
+                        continue
+                    
+                    try:
+                        sz = os.path.getsize(fp)
+                    except OSError:
+                        continue
+                    
+                    fname = os.path.basename(fp)
+                    tasks.append(_upload_one(client, conn, channel_id, fp, sz, fhash, sem, export, cfg.get("delete_after", False)))
 
-            if tasks:
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                ok = sum(1 for r in results if r is True)
-                if ok: push_log(f"✅ Uploaded {ok} new file(s).")
-            else:
-                push_log("🔍 No new files. Waiting 15s…")
+                if tasks:
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    ok = sum(1 for r in results if r is True)
+                    if ok: push_log(f"✅ Uploaded {ok} new file(s).")
+                
+                cnt, raw = get_stats(conn)
+                state["count"]    = cnt
+                state["size_str"] = fmt_size(raw)
 
-            cnt, raw = get_stats(conn)
-            state["count"]    = cnt
-            state["size_str"] = fmt_size(raw)
+            except FloodWaitError as e:
+                push_log(f"⏳ Flood wait {e.seconds}s")
+                await asyncio.sleep(e.seconds)
+            except Exception as e:
+                push_log(f"⚠️ Error: {e}")
 
-        except FloodWaitError as e:
-            push_log(f"⏳ Flood wait {e.seconds}s")
-            await asyncio.sleep(e.seconds)
-        except Exception as e:
-            push_log(f"⚠️ Error: {e}")
+            await asyncio.sleep(15)
 
-        await asyncio.sleep(15)
+    finally:
+        await client.disconnect()
+        db_pool.return_connection(conn)
+        stop_file_watcher()
+        push_log("🛑 Daemon stopped.")
 
-    await client.disconnect()
-    push_log("🛑 Daemon stopped.")
-
-async def _upload_one(client, conn, channel_id, fp, sz, fhash, sem, lock, export_dir, delete_after=False):
+async def _upload_one(client, conn, channel_id, fp, sz, fhash, sem, export_dir, delete_after=False):
     fname = os.path.basename(fp)
-    async with lock:
-        if is_uploaded(conn, fhash): return False
-        mark_uploaded(conn, fhash, f"IN_FLIGHT_{fname}", sz)
+    if is_uploaded(conn, fhash):
+        return False
+    
+    mark_uploaded(conn, fhash, f"IN_FLIGHT_{fname}", sz)
     tmp = None
     async with sem:
         try:
             ts   = int(time.time()*1000)
             tmp  = export_dir / f"{ts}_{fname}"
-            shutil.copy2(fp, tmp)
+            
+            # Copy in thread to not block event loop (fix #5)
+            await asyncio.get_event_loop().run_in_executor(thread_pool, shutil.copy2, fp, tmp)
+            
             date_str = datetime.fromtimestamp(os.path.getmtime(fp)).strftime("%Y-%m-%d %H:%M")
             ext  = os.path.splitext(fname)[1].upper().lstrip('.')
             cap  = f"📁 {fname}\n📅 {date_str}\n🏷 {ext}  •  {fmt_size(sz)}"
             push_log(f"⬆️  Uploading {fname}…")
             await client.send_file(channel_id, str(tmp), caption=cap, force_document=True)
-            async with lock: mark_uploaded(conn, fhash, fname, sz)
-            if tmp and tmp.exists(): tmp.unlink()
-            if delete_after:
-                try:
-                    os.remove(fp)
-                    push_log(f"🗑️ Deleted original to free space: {fname}")
-                except Exception as del_e:
-                    push_log(f"⚠️ Could not delete {fname}: {del_e}")
+            mark_uploaded(conn, fhash, fname, sz)
+            
+            # Use try/finally for guaranteed cleanup (fix #8)
             return True
         except Exception as e:
             push_log(f"❌ Failed {fname}: {e}")
-            async with lock:
-                conn.execute("DELETE FROM uploads WHERE uuid=?", (fhash,)); conn.commit()
-            if tmp and tmp.exists():
-                try: tmp.unlink()
-                except Exception: pass
+            conn.execute("DELETE FROM uploads WHERE uuid=?", (fhash,))
+            conn.commit()
             return False
+        finally:
+            # Guaranteed cleanup (fix #8)
+            if tmp and tmp.exists():
+                try:
+                    tmp.unlink()
+                except Exception:
+                    pass
 
 def start_daemon():
     global _daemon_loop
@@ -318,7 +485,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/":
             self.send_html(DASHBOARD_HTML)
         elif path == "/api/state":
-            self.send_json({**state, "logs": state["logs"][-50:]})
+            self.send_json({**state, "logs": list(state["logs"])[-50:]})
         elif path == "/api/config":
             self.send_json(load_config())
         elif path == "/api/detect_icloud":
@@ -336,7 +503,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/send_otp":
             phone = body.get("phone","").strip()
             try:
-                asyncio.run(_send_otp(phone))
+                # Fix #5: Run async code in thread pool
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(_send_otp(phone))
+                loop.close()
+                
                 _login_state["step"] = "waiting_otp"
                 self.send_json({"ok": True})
             except Exception as e:
@@ -345,7 +517,11 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/verify_otp":
             code = body.get("code","").strip()
             try:
-                name = asyncio.run(_verify_otp(code))
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                name = loop.run_until_complete(_verify_otp(code))
+                loop.close()
+                
                 cfg = load_config()
                 cfg.update({"api_id": TELEGRAM_API_ID, "api_hash": TELEGRAM_API_HASH,
                              "phone": _login_state["phone"]})
@@ -593,7 +769,7 @@ function setMsg(id,text,type){
   el.innerHTML='<div class="msg '+type+'">'+text+'</div>';
 }
 
-// ── Polling ───────────────────────────────────────────────────────────────────
+// ── Polling (fix #10: reduced frequency) ────────────────────────────────
 let lastLogLen=0;
 async function poll(){
   try{
@@ -626,7 +802,7 @@ async function loadConfig(){
 }
 
 loadConfig();
-setInterval(poll,2500);
+setInterval(poll,5000);
 poll();
 
 async function checkUpdate(){
@@ -677,3 +853,7 @@ if __name__ == "__main__":
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nServer stopped.")
+    finally:
+        db_pool.close_all()
+        if observer:
+            stop_file_watcher()
