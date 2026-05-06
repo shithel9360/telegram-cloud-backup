@@ -2,6 +2,36 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.2.2] - 2026-05-06
+
+### ✨ Features
+- **Instant Delete After Backup** - NEW! Immediately delete files from iCloud after successful Telegram upload
+- New Settings checkbox: "⚡ Delete from iCloud immediately after successful backup"
+- Dashboard banner shows when instant delete is enabled
+- Live log provides per-file feedback (✅ uploaded, 🗑️ deleted, ⚠️ errors)
+
+### 🔒 Security & Safety
+- Comprehensive safety checks before deletion:
+  - ✅ File must be confirmed in SQLite as successfully uploaded
+  - ✅ Extension must be supported media type (images/videos only)
+  - ✅ Path must be within backup folder (no directory escape)
+  - ✅ File must still exist on disk
+- Permission error handling (skips locked files gracefully)
+- Only deletes after confirmed successful upload (failed uploads NOT deleted)
+- Feature is disabled by default (opt-in)
+
+### 🐛 Bug Fixes & Improvements
+- Enhanced error handling for edge cases
+- Better logging for deletion operations
+- Improved state tracking (deleted_count counter)
+
+### 📝 Documentation
+- Updated version to 2.2.2
+- Added comprehensive comments in deletion logic
+- Documented all safety checks
+
+---
+
 ## [2.2.1] - 2026-04-30
 
 ### 🔒 Security
@@ -30,7 +60,7 @@ All notable changes to this project will be documented in this file.
 
 ---
 
-## [2.2.0] - Initial Release
+## [2.2.0] - 2026-04-30
 
 ### ✨ Features
 - Zero-setup portable Windows application
@@ -43,3 +73,7 @@ All notable changes to this project will be documented in this file.
 - Auto-cleanup of backed-up files
 - Live backup logs
 - Update checker
+
+---
+
+**Note:** v2.2.0 and v2.2.1 are superseded by v2.2.2. Please upgrade to v2.2.2 for the instant delete feature and security improvements.
