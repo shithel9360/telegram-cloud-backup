@@ -1,7 +1,10 @@
 """
-Telegram Backup Pro — Web Edition (v2.2.2)
+Telegram Backup Pro — Web Edition (v2.2.3)
 Single-file web app. Run with: python app_web.py
 Then open: http://localhost:7878
+
+IMPROVEMENTS IN v2.2.3:
+- FIX: Bundled watchdog module in .exe (fixes 'No module named watchdog' crash on launch)
 
 IMPROVEMENTS IN v2.2.2:
 - NEW: Instant delete after backup feature (immediately frees iCloud space)
@@ -30,7 +33,7 @@ PORT         = 7878
 TELEGRAM_API_ID   = 36355055
 TELEGRAM_API_HASH = "9b819327f0403ce37b08e316a8464cb6"
 
-APP_VERSION  = "2.2.2"          # bumped with instant delete feature
+APP_VERSION  = "2.2.3"          # fix: watchdog bundled in .exe
 GITHUB_REPO  = "shithel9360/telegram-cloud-backup"
 RELEASES_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -997,7 +1000,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </head>
 <body>
 <div class="app">
-  <h1>📸 Telegram Backup Pro v2.2.2</h1>
+  <h1>📸 Telegram Backup Pro v2.2.3</h1>
   <p class="sub">Backup your photos & videos to Telegram — automatically.<br><span style="color:#58a6ff;font-weight:600;">Developed by Shithel</span></p>
 
   <div id="update-banner" style="display:none;background:#1c2a14;border:1px solid #3fb950;border-radius:10px;padding:12px 18px;margin-bottom:16px;display:none;align-items:center;gap:12px;">

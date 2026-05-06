@@ -22,7 +22,7 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install telethon pyinstaller requests
+        pip install telethon pyinstaller requests watchdog
 
     - name: Extract version from app_web.py
       id: get_version
