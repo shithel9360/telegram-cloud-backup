@@ -1,9 +1,10 @@
 """
-Telegram Backup Pro — Web Edition (v2.2.1)
+Telegram Backup Pro — Web Edition (v2.2.2)
 Single-file web app. Run with: python app_web.py
 Then open: http://localhost:7878
 
-IMPROVEMENTS IN v2.2.1:
+IMPROVEMENTS IN v2.2.2:
+- NEW: Instant delete after backup feature (immediately frees iCloud space)
 - Security: SQL injection prevention, path traversal protection, input validation
 - Stability: Event loop cleanup, database error handling, resource management
 - Robustness: Permission error handling, file cleanup, config validation
@@ -29,7 +30,7 @@ PORT         = 7878
 TELEGRAM_API_ID   = 36355055
 TELEGRAM_API_HASH = "9b819327f0403ce37b08e316a8464cb6"
 
-APP_VERSION  = "2.2.1"          # bumped with security fixes
+APP_VERSION  = "2.2.2"          # bumped with instant delete feature
 GITHUB_REPO  = "shithel9360/telegram-cloud-backup"
 RELEASES_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -215,6 +216,8 @@ state = {
     "authorized": False,
     "cleanup_enabled": False,
     "cleanup_count": 0,
+    "delete_after_backup_enabled": False,
+    "deleted_count": 0,
 }
 
 def push_log(msg: str):
@@ -272,6 +275,20 @@ def get_uploaded_files(conn):
     except sqlite3.Error as e:
         logger.error(f"Failed to get uploaded files: {e}")
         return []
+
+def is_file_in_db(conn, local_path):
+    """Check if a file is successfully recorded in the database"""
+    if conn is None:
+        return False
+    try:
+        result = conn.execute(
+            "SELECT 1 FROM uploads WHERE local_path=? AND filename NOT LIKE 'IN_FLIGHT_%' AND filename NOT LIKE 'SKIPPED_%'",
+            (local_path,)
+        ).fetchone()
+        return bool(result)
+    except sqlite3.Error as e:
+        logger.error(f"DB check failed: {e}")
+        return False
 
 def get_stats(conn):
     if conn is None:
@@ -362,6 +379,59 @@ def stop_file_watcher():
             observer.join()
         except Exception as e:
             logger.error(f"Error stopping watcher: {e}")
+
+# ── Instant Delete After Backup (NEW - v2.2.2) ─────────────────────────
+def try_delete_file_after_backup(conn, local_path: str, backup_folder: str) -> bool:
+    """
+    Safely delete a file after successful backup with comprehensive checks.
+    
+    Returns True if deletion succeeded, False otherwise.
+    """
+    if not local_path or not os.path.exists(local_path):
+        return False
+    
+    try:
+        # ✅ Check 1: File must be in DB as successfully uploaded
+        if not is_file_in_db(conn, local_path):
+            logger.warning(f"[DELETE] File not confirmed in DB: {local_path}")
+            return False
+        
+        # ✅ Check 2: File extension must be supported
+        file_ext = os.path.splitext(local_path)[1].lower()
+        if file_ext not in ALL_EXT:
+            logger.warning(f"[DELETE] Unsupported extension: {local_path}")
+            return False
+        
+        # ✅ Check 3: Path must be within backup folder (path traversal check)
+        local_resolved = Path(local_path).resolve()
+        backup_resolved = Path(backup_folder).resolve()
+        if not str(local_resolved).startswith(str(backup_resolved)):
+            logger.error(f"[DELETE] Path traversal attempt blocked: {local_path}")
+            return False
+        
+        # ✅ Check 4: File still exists
+        if not os.path.exists(local_path):
+            logger.info(f"[DELETE] File already deleted: {local_path}")
+            return False
+        
+        # ✅ All checks passed - delete the file
+        os.remove(local_path)
+        push_log(f"🗑️  Deleted from iCloud: {os.path.basename(local_path)}")
+        state["deleted_count"] += 1
+        logger.info(f"[DELETE] Successfully deleted: {local_path}")
+        return True
+        
+    except PermissionError:
+        logger.warning(f"[DELETE] Permission denied: {local_path}")
+        push_log(f"⚠️  Could not delete (permission denied): {os.path.basename(local_path)}")
+        return False
+    except FileNotFoundError:
+        logger.info(f"[DELETE] File already deleted: {local_path}")
+        return False
+    except Exception as e:
+        logger.error(f"[DELETE] Error deleting {local_path}: {e}")
+        push_log(f"⚠️  Could not delete: {os.path.basename(local_path)} ({type(e).__name__})")
+        return False
 
 # ── Storage cleanup ────────────────────────────────────────────────────
 def cleanup_icloud_storage(conn, cleanup_older_than_days=30):
@@ -484,6 +554,7 @@ async def _daemon(cfg):
     api_id      = int(cfg.get("api_id", TELEGRAM_API_ID))
     api_hash    = cfg.get("api_hash", TELEGRAM_API_HASH)
     cleanup_after_backup = cfg.get("cleanup_after_backup", False)
+    delete_after_backup = cfg.get("delete_after_backup", False)
     
     try:
         cleanup_days = int(cfg.get("cleanup_days", 30))
@@ -521,6 +592,7 @@ async def _daemon(cfg):
     
     push_log(f"✅ Connected! Watching: {photos_path}")
     state["cleanup_enabled"] = cleanup_after_backup
+    state["delete_after_backup_enabled"] = delete_after_backup
 
     try:
         while state["status"] == "running":
@@ -583,7 +655,7 @@ async def _daemon(cfg):
                         continue
                     
                     fname = os.path.basename(fp)
-                    tasks.append(_upload_one(client, conn, channel_id, fp, sz, fhash, sem, export, fp))
+                    tasks.append(_upload_one(client, conn, channel_id, fp, sz, fhash, sem, export, fp, photos_path, delete_after_backup))
 
                 if tasks:
                     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -612,7 +684,7 @@ async def _daemon(cfg):
         stop_file_watcher()
         push_log("🛑 Daemon stopped.")
 
-async def _upload_one(client, conn, channel_id, fp, sz, fhash, sem, export_dir, local_path=""):
+async def _upload_one(client, conn, channel_id, fp, sz, fhash, sem, export_dir, local_path="", backup_folder="", delete_after_backup=False):
     fname = os.path.basename(fp)
     if is_uploaded(conn, fhash):
         return False
@@ -632,6 +704,10 @@ async def _upload_one(client, conn, channel_id, fp, sz, fhash, sem, export_dir, 
             push_log(f"⬆️  Uploading {fname}…")
             await client.send_file(channel_id, str(tmp), caption=cap, force_document=True)
             mark_uploaded(conn, fhash, fname, sz, local_path)
+            
+            # ✅ NEW: If delete_after_backup enabled, try to delete file immediately
+            if delete_after_backup and backup_folder:
+                try_delete_file_after_backup(conn, local_path, backup_folder)
             
             return True
         except Exception as e:
@@ -821,6 +897,10 @@ class Handler(BaseHTTPRequestHandler):
                         return
                     cfg["cleanup_days"] = int(body["cleanup_days"])
                 
+                # ✅ NEW: Handle delete_after_backup config option
+                if "delete_after_backup" in body:
+                    cfg["delete_after_backup"] = bool(body["delete_after_backup"])
+                
                 if "windows_startup" in body:
                     cfg["windows_startup"] = bool(body["windows_startup"])
                 
@@ -909,11 +989,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .msg.ok{background:#1a4720;color:#3fb950}
   .msg.err{background:#3d1a1a;color:#f85149}
   .info-row{background:#0d1117;padding:8px 12px;border-left:3px solid #58a6ff;margin:10px 0;font-size:.85rem}
+  .checkbox-wrapper{display:flex;align-items:center;gap:12px;margin-bottom:12px}
+  .checkbox-wrapper input[type="checkbox"]{width:auto;flex:0}
+  .checkbox-wrapper label{margin:0;flex:1}
+  .hint{display:block;color:#8b949e;font-size:.75rem;margin-top:4px}
 </style>
 </head>
 <body>
 <div class="app">
-  <h1>📸 Telegram Backup Pro v2.2.1</h1>
+  <h1>📸 Telegram Backup Pro v2.2.2</h1>
   <p class="sub">Backup your photos & videos to Telegram — automatically.<br><span style="color:#58a6ff;font-weight:600;">Developed by Shithel</span></p>
 
   <div id="update-banner" style="display:none;background:#1c2a14;border:1px solid #3fb950;border-radius:10px;padding:12px 18px;margin-bottom:16px;display:none;align-items:center;gap:12px;">
@@ -937,6 +1021,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
     <div id="cleanup-banner" style="display:none;background:#1a3d1a;border:1px solid #3fb950;border-radius:10px;padding:12px 18px;margin-bottom:16px;">
       <span style="font-size:.9rem;color:#3fb950">✅ Storage cleanup enabled - Backed-up files will be automatically deleted after <span id="cleanup-days">30</span> days</span>
+    </div>
+    <div id="delete-banner" style="display:none;background:#1a3d3d;border:1px solid #3fb950;border-radius:10px;padding:12px 18px;margin-bottom:16px;">
+      <span style="font-size:.9rem;color:#3fb950">⚡ Instant delete enabled - Files will be deleted from iCloud immediately after successful backup</span>
     </div>
     <div class="card">
       <h2>Controls</h2>
@@ -990,6 +1077,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <input id="cleanup_days" type="number" min="1" max="365" value="30" style="max-width:100px;" />
         <span style="color:#8b949e;font-size:.8rem;margin-left:8px;">Files older than this will be deleted</span>
       </div>
+      <div class="row" style="margin-top:16px;">
+        <label style="min-width:auto;cursor:pointer;">
+          <input type="checkbox" id="delete_after_backup" style="min-width:auto;margin-right:8px;vertical-align:middle;">
+          ⚡ <strong>Delete from iCloud immediately after successful backup</strong>
+        </label>
+      </div>
+      <p style="color:#f85149;font-size:.75rem;margin-bottom:16px;margin-left:28px;">
+        ⚠️ Files will be permanently deleted immediately after Telegram upload. This cannot be undone.
+      </p>
       <div class="row" style="margin-top:16px;">
         <label style="min-width:auto;cursor:pointer;">
           <input type="checkbox" id="windows_startup" style="min-width:auto;margin-right:8px;vertical-align:middle;">
@@ -1056,16 +1152,18 @@ async function saveSettings(){
   const path=document.getElementById('photos_path').value.trim();
   const cleanup=document.getElementById('cleanup_after_backup').checked;
   const cleanup_days=parseInt(document.getElementById('cleanup_days').value) || 30;
+  const deleteAfterBackup=document.getElementById('delete_after_backup').checked;
   const startup=document.getElementById('windows_startup').checked;
   const auto=document.getElementById('auto_start_backup').checked;
   const r=await api('POST','/api/save_config',{
     photos_path:path, 
     cleanup_after_backup:cleanup,
     cleanup_days:cleanup_days,
+    delete_after_backup:deleteAfterBackup,
     windows_startup:startup,
     auto_start_backup:auto
   });
-  setMsg('settings-msg', r.ok?'✅ Saved!':'❌ '+(r.error||'Error'),'ok');
+  setMsg('settings-msg', r.ok?'✅ Saved!':'❌ '+(r.error||'Error'), r.ok?'ok':'err');
 }
 
 async function startBackup(){ await api('POST','/api/start',{}); }
@@ -1098,6 +1196,7 @@ async function poll(){
       box.scrollTop=box.scrollHeight;
     }
     document.getElementById('cleanup-banner').style.display=d.cleanup_enabled?'block':'none';
+    document.getElementById('delete-banner').style.display=d.delete_after_backup_enabled?'block':'none';
   }catch(e){}
 }
 
@@ -1109,6 +1208,7 @@ async function loadConfig(){
     if(c.photos_path) document.getElementById('photos_path').value=c.photos_path;
     if(c.cleanup_after_backup) document.getElementById('cleanup_after_backup').checked=true;
     if(c.cleanup_days) document.getElementById('cleanup_days').value=c.cleanup_days;
+    if(c.delete_after_backup) document.getElementById('delete_after_backup').checked=true;
     if(c.windows_startup) document.getElementById('windows_startup').checked=true;
     if(c.auto_start_backup) document.getElementById('auto_start_backup').checked=true;
   }catch(e){}
