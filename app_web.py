@@ -1,7 +1,24 @@
 """
-Telegram Backup Pro — Web Edition (v2.2.3)
+Telegram Backup Pro — Web Edition (v3.0.0)
 Single-file web app. Run with: python app_web.py
 Then open: http://localhost:7878
+
+IMPROVEMENTS IN v2.3.0:
+- BUG 1 FIX: validate_path() rewritten to allow iCloud paths (C:\\iCloudDrive etc)
+- BUG 1 FIX: detect_icloud() now searches all Windows iCloud locations
+- BUG 1 FIX: try_delete_file_after_backup() falls back to hash-based DB check
+- BUG 2A FIX: clean_inflight_entries() removes stuck IN_FLIGHT DB rows on startup
+- BUG 2B FIX: compute_file_hash() skips placeholders, uses mtime-aware cache
+- BUG 2C FIX: _uploading_now set prevents concurrent duplicate uploads
+- BUG 2D FIX: Full rescan throttled to once per 60 seconds
+- BUG 3 FIX: do_self_update() downloads and applies .exe update automatically
+- BUG 4 FIX: File gather merges watcher events + periodic walk cleanly
+- BUG 5 FIX: 5-second cooldown added after each upload batch
+- BUG 6 FIX: Delete-after-backup now verifies by hash before deleting
+- BUG 7 FIX: SQLite connections use check_same_thread=False + _db_lock
+- BUG 8 FIX: Auto-start skipped if session file missing/empty
+- BUG 9 FIX: cleanup_icloud_storage() skips files outside current backup folder
+- BUG 10 FIX: Update banner uses POST /api/do_update with progress feedback
 
 IMPROVEMENTS IN v2.2.3:
 - FIX: Bundled watchdog module in .exe (fixes 'No module named watchdog' crash on launch)
@@ -33,7 +50,11 @@ PORT         = 7878
 TELEGRAM_API_ID   = 36355055
 TELEGRAM_API_HASH = "9b819327f0403ce37b08e316a8464cb6"
 
-APP_VERSION  = "2.2.3"          # fix: watchdog bundled in .exe
+APP_VERSION  = "3.0.0"
+
+# Improvement 1: Upload retry settings
+MAX_RETRIES   = 3
+RETRY_DELAYS  = [5, 15, 45]   # seconds between attempts
 GITHUB_REPO  = "shithel9360/telegram-cloud-backup"
 RELEASES_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -84,23 +105,42 @@ def validate_cleanup_days(days: int) -> bool:
         return False
 
 def validate_path(user_path: str) -> bool:
-    """Validate path is within allowed directories (Security Fix #2)"""
-    if not user_path or len(user_path) > 260:  # Windows path limit
+    """Validate path is safe to use (Bug 1 Fix: permissive for iCloud/custom paths)"""
+    if not user_path:
+        return False
+    if len(user_path) > 520:  # Allow long Windows paths
+        return False
+    if '\x00' in user_path:
+        return False
+    # Block actual traversal attacks
+    parts = Path(user_path).parts
+    if '..' in parts:
         return False
     try:
-        user_resolved = Path(user_path).resolve()
-        # Allow paths in Pictures, Documents, or Downloads
-        allowed_bases = [
-            Path.home() / "Pictures",
-            Path.home() / "Documents",
-            Path.home() / "Downloads",
-        ]
-        for base in allowed_bases:
-            if str(user_resolved).startswith(str(base)):
-                return True
-        return False
+        resolved = Path(user_path).resolve()
     except (OSError, ValueError):
         return False
+    resolved_str = str(resolved).lower()
+    # Block known system directories on Windows
+    _blocked = [
+        'windows\\system32', 'windows\\syswow64', 'windows\\winsxs',
+        'program files', 'programdata', '\\windows\\',
+    ]
+    for b in _blocked:
+        if b in resolved_str:
+            return False
+    # Accept any path under home directory
+    try:
+        home_str = str(Path.home().resolve()).lower()
+        if resolved_str.startswith(home_str):
+            return True
+    except Exception:
+        pass
+    # Accept any absolute path on a drive root that is not a system dir
+    # e.g. C:\Users\..., D:\..., /mnt/...
+    if Path(user_path).is_absolute():
+        return True
+    return False
 
 # ── Config Cache (fix #4) ─────────────────────────────────────────────
 _config_cache = None
@@ -133,7 +173,10 @@ def save_config(cfg: dict):
     except Exception as e:
         logger.error(f"Failed to save config: {e}")
 
-# ── Database Connection Pool (fix #9) ──────────────────────────────────
+# ── Global DB lock for thread safety (Bug 7 Fix) ──────────────────────
+_db_lock = threading.Lock()
+
+# ── Database Connection Pool ────────────────────────────────────────────
 class DBConnectionPool:
     def __init__(self, db_path, pool_size=5):
         self.db_path = db_path
@@ -141,7 +184,7 @@ class DBConnectionPool:
         self.lock = threading.Lock()
         for _ in range(pool_size):
             try:
-                conn = sqlite3.connect(str(db_path), check_same_thread=True, timeout=30)
+                conn = sqlite3.connect(str(db_path), check_same_thread=False, timeout=30)
                 conn.execute("PRAGMA journal_mode=WAL")
                 self.pool.append(conn)
             except Exception as e:
@@ -154,6 +197,10 @@ class DBConnectionPool:
             conn.execute("""CREATE TABLE IF NOT EXISTS uploads (
                 uuid TEXT PRIMARY KEY, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                 filename TEXT, file_size INTEGER DEFAULT 0, local_path TEXT)""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS failed_uploads (
+                local_path TEXT PRIMARY KEY, filename TEXT, fail_reason TEXT,
+                fail_count INTEGER DEFAULT 1,
+                last_attempt DATETIME DEFAULT CURRENT_TIMESTAMP)""")
             conn.commit()
         except sqlite3.Error as e:
             logger.error(f"Database initialization failed: {e}")
@@ -163,7 +210,7 @@ class DBConnectionPool:
             if self.pool:
                 return self.pool.pop()
         try:
-            return sqlite3.connect(str(self.db_path), check_same_thread=True, timeout=30)
+            return sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=30)
         except sqlite3.Error as e:
             logger.error(f"Cannot create database connection: {e}")
             return None
@@ -234,19 +281,21 @@ def is_uploaded(conn, fhash):
     if conn is None:
         return False
     try:
-        return bool(conn.execute("SELECT 1 FROM uploads WHERE uuid=?", (fhash,)).fetchone())
+        with _db_lock:
+            return bool(conn.execute("SELECT 1 FROM uploads WHERE uuid=?", (fhash,)).fetchone())
     except sqlite3.Error as e:
         logger.error(f"DB query failed: {e}")
         return False
 
 def are_uploaded_batch(conn, fhashes):
-    """Batch check - fix #7: N+1 queries"""
+    """Batch check with _db_lock (Bug 7 Fix)"""
     if conn is None or not fhashes:
         return set()
     try:
         placeholders = ','.join(['?'] * len(fhashes))
         query = f"SELECT uuid FROM uploads WHERE uuid IN ({placeholders})"
-        results = conn.execute(query, fhashes).fetchall()
+        with _db_lock:
+            results = conn.execute(query, list(fhashes)).fetchall()
         return {row[0] for row in results}
     except sqlite3.Error as e:
         logger.error(f"Batch query failed: {e}")
@@ -256,13 +305,15 @@ def mark_uploaded(conn, fhash, fname, size, local_path=""):
     if conn is None:
         return
     try:
-        conn.execute("REPLACE INTO uploads VALUES(?,CURRENT_TIMESTAMP,?,?,?)", 
-                    (fhash, fname, size, local_path))
-        conn.commit()
+        with _db_lock:
+            conn.execute("REPLACE INTO uploads VALUES(?,CURRENT_TIMESTAMP,?,?,?)",
+                        (fhash, fname, size, local_path))
+            conn.commit()
     except sqlite3.Error as e:
         logger.error(f"Failed to mark uploaded: {e}")
         try:
-            conn.rollback()
+            with _db_lock:
+                conn.rollback()
         except:
             pass
 
@@ -271,9 +322,10 @@ def get_uploaded_files(conn):
     if conn is None:
         return []
     try:
-        results = conn.execute(
-            "SELECT uuid, filename, file_size, local_path FROM uploads WHERE filename NOT LIKE 'IN_FLIGHT%' AND filename NOT LIKE 'SKIPPED%'"
-        ).fetchall()
+        with _db_lock:
+            results = conn.execute(
+                "SELECT uuid, filename, file_size, local_path FROM uploads WHERE filename NOT LIKE 'IN_FLIGHT%' AND filename NOT LIKE 'SKIPPED%'"
+            ).fetchall()
         return results
     except sqlite3.Error as e:
         logger.error(f"Failed to get uploaded files: {e}")
@@ -284,20 +336,90 @@ def is_file_in_db(conn, local_path):
     if conn is None:
         return False
     try:
-        result = conn.execute(
-            "SELECT 1 FROM uploads WHERE local_path=? AND filename NOT LIKE 'IN_FLIGHT_%' AND filename NOT LIKE 'SKIPPED_%'",
-            (local_path,)
-        ).fetchone()
+        with _db_lock:
+            result = conn.execute(
+                "SELECT 1 FROM uploads WHERE local_path=? AND filename NOT LIKE 'IN_FLIGHT_%' AND filename NOT LIKE 'SKIPPED_%'",
+                (local_path,)
+            ).fetchone()
         return bool(result)
     except sqlite3.Error as e:
         logger.error(f"DB check failed: {e}")
         return False
 
+def is_hash_uploaded_and_confirmed(conn, fhash):
+    """Bug 1 Fix: check by hash that file was fully uploaded (not IN_FLIGHT/SKIPPED)"""
+    if conn is None:
+        return False
+    try:
+        with _db_lock:
+            result = conn.execute(
+                "SELECT 1 FROM uploads WHERE uuid=? AND filename NOT LIKE 'IN_FLIGHT_%' AND filename NOT LIKE 'SKIPPED_%'",
+                (fhash,)
+            ).fetchone()
+        return bool(result)
+    except sqlite3.Error as e:
+        logger.error(f"Hash confirm check failed: {e}")
+        return False
+
+def clean_inflight_entries(conn):
+    """Bug 2A Fix: remove stuck IN_FLIGHT rows from a previous crash"""
+    if conn is None:
+        return
+    try:
+        with _db_lock:
+            conn.execute("DELETE FROM uploads WHERE filename LIKE 'IN_FLIGHT_%'")
+            conn.commit()
+        push_log("🧹 Cleaned up any incomplete upload entries.")
+    except sqlite3.Error as e:
+        logger.error(f"Failed to clean IN_FLIGHT entries: {e}")
+
+def mark_failed_upload(conn, local_path, filename, reason):
+    """Improvement 1: record a persistently-failing file"""
+    if conn is None:
+        return
+    try:
+        with _db_lock:
+            conn.execute("""
+                INSERT INTO failed_uploads(local_path,filename,fail_reason,fail_count,last_attempt)
+                VALUES(?,?,?,1,CURRENT_TIMESTAMP)
+                ON CONFLICT(local_path) DO UPDATE SET
+                    fail_count=fail_count+1, fail_reason=excluded.fail_reason,
+                    last_attempt=CURRENT_TIMESTAMP
+            """, (local_path, filename, str(reason)))
+            conn.commit()
+    except sqlite3.Error as e:
+        logger.error(f"Failed to mark failed upload: {e}")
+
+def get_failed_uploads(conn):
+    """Improvement 1: list of persistently failed files"""
+    if conn is None:
+        return []
+    try:
+        with _db_lock:
+            return conn.execute(
+                "SELECT local_path,filename,fail_reason,fail_count,last_attempt FROM failed_uploads ORDER BY last_attempt DESC"
+            ).fetchall()
+    except sqlite3.Error as e:
+        logger.error(f"Failed to get failed uploads: {e}")
+        return []
+
+def remove_failed_upload(conn, local_path):
+    """Improvement 1: clear a file from failed list (retry)"""
+    if conn is None:
+        return
+    try:
+        with _db_lock:
+            conn.execute("DELETE FROM failed_uploads WHERE local_path=?", (local_path,))
+            conn.commit()
+    except sqlite3.Error as e:
+        logger.error(f"Failed to remove failed upload: {e}")
+
 def get_stats(conn):
     if conn is None:
         return 0, 0
     try:
-        r = conn.execute("SELECT COUNT(*),SUM(file_size) FROM uploads WHERE filename NOT LIKE 'SKIPPED%'").fetchone()
+        with _db_lock:
+            r = conn.execute("SELECT COUNT(*),SUM(file_size) FROM uploads WHERE filename NOT LIKE 'SKIPPED%'").fetchone()
         return r[0] or 0, r[1] or 0
     except sqlite3.Error as e:
         logger.error(f"Failed to get stats: {e}")
@@ -311,17 +433,31 @@ def fmt_size(b):
     return f"{b} B"
 
 def detect_icloud():
+    """Bug 1 Fix: Search all known iCloud locations on Windows + macOS"""
     candidates = [
-        Path.home()/"Pictures"/"iCloud Photos"/"Photos",
-        Path.home()/"Pictures"/"iCloud Photos",
-        Path.home()/"Pictures",
+        Path.home() / "iCloudDrive",
+        Path.home() / "Apple" / "Mobile Documents" / "com~apple~CloudDocs",
+        Path.home() / "Pictures" / "iCloud Photos" / "Photos",
+        Path.home() / "Pictures" / "iCloud Photos",
+        Path.home() / "Pictures",
     ]
+    # Try Windows-specific path via os.getlogin()
+    try:
+        win_path = Path("C:/Users") / os.getlogin() / "iCloudDrive"
+        if win_path not in candidates:
+            candidates.insert(2, win_path)
+    except Exception:
+        pass
     for c in candidates:
-        if c.exists(): return str(c)
-    return str(Path.home()/"Pictures")
+        try:
+            if c.exists():
+                return str(c)
+        except Exception:
+            continue
+    return str(Path.home() / "Pictures")
 
-# ── File hashing (fix #3) ──────────────────────────────────────────────
-_hash_cache = {}
+# ── File hashing (Bug 2B Fix: mtime-aware cache + placeholder detection) ────────────
+_hash_cache      = {}  # {filepath: (mtime, hash_value)}
 _hash_cache_lock = threading.Lock()
 
 def compute_file_hash(filepath, use_cache=True):
@@ -348,8 +484,16 @@ def compute_file_hash(filepath, use_cache=True):
         return None
 
 # ── File system watcher (fix #1) ───────────────────────────────────────
-pending_files = set()
+pending_files      = set()
 pending_files_lock = threading.Lock()
+
+# Bug 2C Fix: prevent duplicate concurrent uploads
+_uploading_now      = set()
+_uploading_lock     = threading.Lock()
+
+# Improvement 2: per-file upload progress
+_upload_progress      = {}  # {fname: pct_int}
+_upload_progress_lock = threading.Lock()
 
 class FileSystemWatcher(FileSystemEventHandler):
     def on_created(self, event):
@@ -383,114 +527,170 @@ def stop_file_watcher():
         except Exception as e:
             logger.error(f"Error stopping watcher: {e}")
 
-# ── Instant Delete After Backup (NEW - v2.2.2) ─────────────────────────
-def try_delete_file_after_backup(conn, local_path: str, backup_folder: str) -> bool:
+# ── Instant Delete After Backup ──────────────────────────────────────────
+def try_delete_file_after_backup(conn, local_path: str, backup_folder: str, fhash: str = "") -> bool:
     """
-    Safely delete a file after successful backup with comprehensive checks.
-    
+    Safely delete a file after successful backup.
+    Bug 1/6 Fix: falls back to hash-based DB check if path-based check fails.
     Returns True if deletion succeeded, False otherwise.
     """
     if not local_path or not os.path.exists(local_path):
         return False
-    
+
     try:
-        # ✅ Check 1: File must be in DB as successfully uploaded
-        if not is_file_in_db(conn, local_path):
+        # Check 1: File confirmed in DB (by path OR by hash fallback)
+        confirmed = is_file_in_db(conn, local_path)
+        if not confirmed and fhash:
+            confirmed = is_hash_uploaded_and_confirmed(conn, fhash)
+            if confirmed:
+                logger.info(f"[DELETE] Confirmed by hash fallback: {local_path}")
+        if not confirmed:
             logger.warning(f"[DELETE] File not confirmed in DB: {local_path}")
             return False
-        
-        # ✅ Check 2: File extension must be supported
+
+        # Check 2: Extension must be supported
         file_ext = os.path.splitext(local_path)[1].lower()
         if file_ext not in ALL_EXT:
             logger.warning(f"[DELETE] Unsupported extension: {local_path}")
             return False
-        
-        # ✅ Check 3: Path must be within backup folder (path traversal check)
-        local_resolved = Path(local_path).resolve()
+
+        # Check 3: Path must be within backup folder (path traversal guard)
+        local_resolved  = Path(local_path).resolve()
         backup_resolved = Path(backup_folder).resolve()
         if not str(local_resolved).startswith(str(backup_resolved)):
-            logger.error(f"[DELETE] Path traversal attempt blocked: {local_path}")
+            logger.error(f"[DELETE] Path traversal blocked: {local_path}")
             return False
-        
-        # ✅ Check 4: File still exists
+
+        # Check 4: File still exists
         if not os.path.exists(local_path):
-            logger.info(f"[DELETE] File already deleted: {local_path}")
+            logger.info(f"[DELETE] Already deleted: {local_path}")
             return False
-        
-        # ✅ All checks passed - delete the file
+
         os.remove(local_path)
-        push_log(f"🗑️  Deleted from iCloud: {os.path.basename(local_path)}")
+        push_log(f"\U0001f5d1\ufe0f  Deleted from iCloud: {os.path.basename(local_path)}")
         state["deleted_count"] += 1
-        logger.info(f"[DELETE] Successfully deleted: {local_path}")
+        logger.info(f"[DELETE] Deleted: {local_path}")
         return True
-        
+
     except PermissionError:
-        logger.warning(f"[DELETE] Permission denied: {local_path}")
-        push_log(f"⚠️  Could not delete (permission denied): {os.path.basename(local_path)}")
+        push_log(f"\u26a0\ufe0f  Permission denied: {os.path.basename(local_path)}")
         return False
     except FileNotFoundError:
-        logger.info(f"[DELETE] File already deleted: {local_path}")
         return False
     except Exception as e:
-        logger.error(f"[DELETE] Error deleting {local_path}: {e}")
-        push_log(f"⚠️  Could not delete: {os.path.basename(local_path)} ({type(e).__name__})")
+        logger.error(f"[DELETE] Error: {e}")
         return False
 
-# ── Storage cleanup ────────────────────────────────────────────────────
-def cleanup_icloud_storage(conn, cleanup_older_than_days=30):
-    """Clean up backed-up files from iCloud storage after confirmation"""
+# ── Storage cleanup (Bug 9 Fix: boundary check) ──────────────────────────
+def cleanup_icloud_storage(conn, cleanup_older_than_days=30, backup_folder=""):
+    """Clean up backed-up files; only deletes within current backup_folder."""
     if conn is None:
         return 0, 0
-    
     try:
         uploaded_files = get_uploaded_files(conn)
-        cutoff_time = time.time() - (cleanup_older_than_days * 86400)
-        deleted_count = 0
-        deleted_size = 0
-        failed_files = []
-        
+        cutoff_time    = time.time() - (cleanup_older_than_days * 86400)
+        deleted_count  = 0
+        deleted_size   = 0
+        failed_files   = []
+
         for uuid, filename, file_size, local_path in uploaded_files:
             if not local_path:
                 continue
-            
+
+            # Bug 9 Fix: skip files outside the current backup folder
+            if backup_folder:
+                try:
+                    local_resolved  = Path(local_path).resolve()
+                    backup_resolved = Path(backup_folder).resolve()
+                    if not str(local_resolved).startswith(str(backup_resolved)):
+                        push_log(f"\u23ed\ufe0f Skipping (outside backup folder): {filename}")
+                        continue
+                except Exception:
+                    continue
+
             try:
                 file_path = Path(local_path)
                 if not file_path.exists():
-                    push_log(f"⏭️  Skipped (not found): {filename}")
+                    push_log(f"\u23ed\ufe0f  Skipped (not found): {filename}")
                     continue
-                
                 if file_path.stat().st_mtime > cutoff_time:
-                    push_log(f"⏭️  Too new to delete: {filename}")
+                    push_log(f"\u23ed\ufe0f  Too new to delete: {filename}")
                     continue
-                
                 file_path.unlink()
                 deleted_count += 1
-                deleted_size += file_size or 0
-                push_log(f"🗑️  Deleted backed-up file: {filename}")
-                
+                deleted_size  += file_size or 0
+                push_log(f"\U0001f5d1\ufe0f  Deleted backed-up file: {filename}")
             except PermissionError:
                 failed_files.append((filename, "Permission denied"))
-                push_log(f"⚠️  Permission denied: {filename}")
+                push_log(f"\u26a0\ufe0f  Permission denied: {filename}")
             except FileNotFoundError:
-                push_log(f"⏭️  Already deleted: {filename}")
+                push_log(f"\u23ed\ufe0f  Already deleted: {filename}")
             except Exception as e:
                 failed_files.append((filename, str(e)))
-                push_log(f"⚠️  Failed to delete {filename}: {e}")
-        
+                push_log(f"\u26a0\ufe0f  Failed to delete {filename}: {e}")
+
         if deleted_count > 0:
-            push_log(f"✅ Cleanup complete: {deleted_count} files deleted ({fmt_size(deleted_size)})")
+            push_log(f"\u2705 Cleanup complete: {deleted_count} files deleted ({fmt_size(deleted_size)})")
             state["cleanup_count"] += deleted_count
-        
         if failed_files:
-            push_log(f"⚠️  {len(failed_files)} files could not be deleted")
-        
+            push_log(f"\u26a0\ufe0f  {len(failed_files)} files could not be deleted")
         return deleted_count, deleted_size
-    
     except Exception as e:
-        push_log(f"❌ Cleanup failed: {e}")
+        push_log(f"\u274c Cleanup failed: {e}")
         return 0, 0
 
-# ── Auto-updater ──────────────────────────────────────────────────────
+# ── Self-updater (Bug 3 Fix) ───────────────────────────────────────────
+def do_self_update(download_url: str) -> bool:
+    """Download new .exe and replace current one via batch script (Windows only)."""
+    try:
+        import urllib.request
+        push_log("\u2b07\ufe0f Downloading update...")
+        tmp_path = Path(tempfile.gettempdir()) / "TelegramBackup_new.exe"
+
+        def _progress_hook(count, block_size, total):
+            if total > 0:
+                pct = min(int(count * block_size * 100 / total), 100)
+                push_log(f"\u2b07\ufe0f Downloading... {pct}%")
+
+        urllib.request.urlretrieve(download_url, str(tmp_path), reporthook=_progress_hook)
+        push_log("\u2705 Download complete. Applying update...")
+
+        if not getattr(sys, 'frozen', False):
+            push_log("\u26a0\ufe0f Auto-update only works in the packaged .exe. Please update manually.")
+            return False
+
+        current_exe = Path(sys.executable)
+        backup_exe  = current_exe.with_suffix('.exe.bak')
+        bat_path    = Path(tempfile.gettempdir()) / "tele_backup_update.bat"
+        bat_content = f"""@echo off
+:wait
+tasklist /fi "PID eq {os.getpid()}" 2>nul | find /i "TelegramBackup" >nul
+if not errorlevel 1 (
+    timeout /t 1 /nobreak >nul
+    goto wait
+)
+move /y "{current_exe}" "{backup_exe}"
+move /y "{tmp_path}" "{current_exe}"
+start "" "{current_exe}"
+timeout /t 3 /nobreak >nul
+del "{backup_exe}" 2>nul
+del "%~f0"
+"""
+        bat_path.write_text(bat_content)
+        import subprocess
+        subprocess.Popen(
+            ['cmd', '/c', str(bat_path)],
+            creationflags=subprocess.CREATE_NEW_CONSOLE | subprocess.DETACHED_PROCESS
+        )
+        push_log("\U0001f504 Restarting with new version...")
+        time.sleep(1)
+        os._exit(0)
+        return True
+    except Exception as e:
+        push_log(f"\u274c Update failed: {e}")
+        return False
+
+# ── Auto-updater check ──────────────────────────────────────────────
 def check_for_update():
     """Check GitHub for a newer release version"""
     try:
@@ -535,30 +735,26 @@ async def _daemon(cfg):
     from telethon.errors import FloodWaitError
 
     try:
-        channel_id  = int(cfg["channel_id"])
+        channel_id = int(cfg["channel_id"])
     except (ValueError, KeyError):
-        push_log("❌ Invalid channel ID")
+        push_log("\u274c Invalid channel ID")
         state["status"] = "stopped"
         return
 
     photos_path = cfg.get("photos_path", "")
-    
-    # Security Fix #2: Validate path
     if not validate_path(photos_path):
-        push_log(f"❌ Invalid photos path: {photos_path}")
+        push_log(f"\u274c Invalid photos path: {photos_path}")
         state["status"] = "stopped"
         return
-    
     if not Path(photos_path).exists():
-        push_log(f"❌ Photos folder not found: {photos_path}")
+        push_log(f"\u274c Photos folder not found: {photos_path}")
         state["status"] = "stopped"
         return
 
-    api_id      = int(cfg.get("api_id", TELEGRAM_API_ID))
-    api_hash    = cfg.get("api_hash", TELEGRAM_API_HASH)
+    api_id   = int(cfg.get("api_id", TELEGRAM_API_ID))
+    api_hash = cfg.get("api_hash", TELEGRAM_API_HASH)
     cleanup_after_backup = cfg.get("cleanup_after_backup", False)
-    delete_after_backup = cfg.get("delete_after_backup", False)
-    
+    delete_after_backup  = cfg.get("delete_after_backup", False)
     try:
         cleanup_days = int(cfg.get("cleanup_days", 30))
         if not validate_cleanup_days(cleanup_days):
@@ -567,159 +763,233 @@ async def _daemon(cfg):
         cleanup_days = 30
 
     start_file_watcher(photos_path)
-
     client = TelegramClient(SESSION_FILE, api_id, api_hash)
     await client.connect()
     if not await client.is_user_authorized():
-        push_log("❌ Not authorized. Please log in first.")
+        push_log("\u274c Not authorized. Please log in first.")
         state["status"] = "stopped"
         await client.disconnect()
         stop_file_watcher()
         return
 
-    sem    = asyncio.Semaphore(2)
-    conn   = db_pool.get_connection()
+    sem  = asyncio.Semaphore(2)
+    conn = db_pool.get_connection()
     if conn is None:
-        push_log("❌ Cannot connect to database")
+        push_log("\u274c Cannot connect to database")
         state["status"] = "stopped"
         await client.disconnect()
         stop_file_watcher()
         return
-    
+
+    # Bug 2A Fix: clean any stuck IN_FLIGHT rows from a previous crash
+    clean_inflight_entries(conn)
+
     export = Path(tempfile.gettempdir()) / "tele_backup_export"
     try:
         export.mkdir(exist_ok=True)
     except Exception as e:
-        push_log(f"⚠️ Failed to create temp directory: {e}")
+        push_log(f"\u26a0\ufe0f Failed to create temp directory: {e}")
         export = Path(tempfile.gettempdir())
-    
-    push_log(f"✅ Connected! Watching: {photos_path}")
-    state["cleanup_enabled"] = cleanup_after_backup
+
+    push_log(f"\u2705 Connected! Watching: {photos_path}")
+    state["cleanup_enabled"]             = cleanup_after_backup
     state["delete_after_backup_enabled"] = delete_after_backup
+
+    last_full_scan_time = 0.0  # Bug 2D/4 Fix: throttle full scans
 
     try:
         while state["status"] == "running":
             try:
-                files_to_check = []
-                
+                # Bug 4 Fix: always drain watcher events first
                 with pending_files_lock:
                     files_to_check = list(pending_files)
                     pending_files.clear()
-                
-                if len(files_to_check) == 0:
+
+                # Bug 2D/4 Fix: merge periodic full walk every 60s
+                now = time.time()
+                if now - last_full_scan_time >= 60:
+                    last_full_scan_time = now
                     try:
                         for root, dirs, fnames in os.walk(photos_path):
                             dirs[:] = [d for d in dirs if not d.startswith('.')]
                             for fn in fnames:
                                 if fn.lower().endswith(ALL_EXT):
-                                    files_to_check.append(os.path.join(root, fn))
+                                    full_p = os.path.join(root, fn)
+                                    if full_p not in files_to_check:
+                                        files_to_check.append(full_p)
                     except PermissionError as e:
-                        push_log(f"⚠️ Permission error scanning files: {e}")
+                        push_log(f"\u26a0\ufe0f Permission error scanning: {e}")
                     except Exception as e:
-                        push_log(f"⚠️ Error scanning files: {e}")
-                
-                now = time.time()
-                tasks = []
-                
-                file_hashes = {}
+                        push_log(f"\u26a0\ufe0f Scan error: {e}")
+
+                # Bug 4 Fix: sleep if nothing found at all
+                if not files_to_check:
+                    await asyncio.sleep(5)
+                    continue
+
+                now2      = time.time()
+                file_hashes: dict = {}
                 for fp in files_to_check:
                     try:
-                        sz = os.path.getsize(fp)
                         mtime = os.path.getmtime(fp)
                     except OSError:
                         continue
-                    
-                    if now - mtime < 3:
+                    if now2 - mtime < 3:
                         continue
-                    
                     fhash = compute_file_hash(fp, use_cache=True)
                     if fhash:
                         file_hashes[fp] = fhash
-                
+
                 if not file_hashes:
                     if cleanup_after_backup:
                         await asyncio.sleep(1)
-                        cleanup_icloud_storage(conn, cleanup_days)
-                    
-                    push_log("🔍 No new files. Waiting 15s…")
+                        cleanup_icloud_storage(conn, cleanup_days, photos_path)
+                    push_log("\U0001f50d No new files. Waiting...")
                     await asyncio.sleep(15)
                     continue
-                
-                hashes_list = list(file_hashes.values())
-                uploaded_set = are_uploaded_batch(conn, hashes_list)
-                
+
+                uploaded_set = are_uploaded_batch(conn, list(file_hashes.values()))
+                tasks = []
                 for fp, fhash in file_hashes.items():
                     if fhash in uploaded_set:
                         continue
-                    
                     try:
                         sz = os.path.getsize(fp)
                     except OSError:
                         continue
-                    
-                    fname = os.path.basename(fp)
-                    tasks.append(_upload_one(client, conn, channel_id, fp, sz, fhash, sem, export, fp, photos_path, delete_after_backup))
+                    tasks.append(_upload_one(
+                        client, conn, channel_id, fp, sz, fhash,
+                        sem, export, fp, photos_path, delete_after_backup
+                    ))
 
                 if tasks:
                     results = await asyncio.gather(*tasks, return_exceptions=True)
                     ok = sum(1 for r in results if r is True)
-                    if ok: 
-                        push_log(f"✅ Uploaded {ok} new file(s).")
+                    if ok:
+                        push_log(f"\u2705 Uploaded {ok} new file(s).")
                         if cleanup_after_backup:
                             await asyncio.sleep(2)
-                            cleanup_icloud_storage(conn, cleanup_days)
-                
+                            cleanup_icloud_storage(conn, cleanup_days, photos_path)
+                    # Bug 5 Fix: cooldown after upload batch
+                    await asyncio.sleep(5)
+
                 cnt, raw = get_stats(conn)
                 state["count"]    = cnt
                 state["size_str"] = fmt_size(raw)
 
             except FloodWaitError as e:
-                push_log(f"⏳ Flood wait {e.seconds}s")
+                push_log(f"\u23f3 Flood wait {e.seconds}s")
                 await asyncio.sleep(e.seconds)
             except Exception as e:
-                push_log(f"⚠️ Error: {e}")
-
-            await asyncio.sleep(15)
+                push_log(f"\u26a0\ufe0f Error: {e}")
+                await asyncio.sleep(5)
 
     finally:
         await client.disconnect()
         db_pool.return_connection(conn)
         stop_file_watcher()
-        push_log("🛑 Daemon stopped.")
+        push_log("\U0001f6d1 Daemon stopped.")
 
 async def _upload_one(client, conn, channel_id, fp, sz, fhash, sem, export_dir, local_path="", backup_folder="", delete_after_backup=False):
+    """Upload one file with retry, progress, dedup guard, and hash-verified delete."""
+    from telethon.errors import FloodWaitError
     fname = os.path.basename(fp)
+
+    # Bug 2C Fix: deduplicate concurrent uploads
+    with _uploading_lock:
+        if fhash in _uploading_now:
+            return False
+        _uploading_now.add(fhash)
+
     if is_uploaded(conn, fhash):
+        with _uploading_lock:
+            _uploading_now.discard(fhash)
         return False
-    
+
     mark_uploaded(conn, fhash, f"IN_FLIGHT_{fname}", sz, local_path)
     tmp = None
     async with sem:
         try:
-            ts   = int(time.time()*1000)
-            tmp  = export_dir / f"{ts}_{fname}"
-            
+            ts  = int(time.time() * 1000)
+            tmp = export_dir / f"{ts}_{fname}"
             await asyncio.get_event_loop().run_in_executor(thread_pool, shutil.copy2, fp, tmp)
-            
+
             date_str = datetime.fromtimestamp(os.path.getmtime(fp)).strftime("%Y-%m-%d %H:%M")
-            ext  = os.path.splitext(fname)[1].upper().lstrip('.')
-            cap  = f"📁 {fname}\n📅 {date_str}\n🏷 {ext}  •  {fmt_size(sz)}"
-            push_log(f"⬆️  Uploading {fname}…")
-            await client.send_file(channel_id, str(tmp), caption=cap, force_document=True)
+            ext = os.path.splitext(fname)[1].upper().lstrip('.')
+            cap = f"\U0001f4c1 {fname}\n\U0001f4c5 {date_str}\n\U0001f3f7 {ext}  \u2022  {fmt_size(sz)}"
+
+            # Improvement 2: progress callback
+            def make_progress_callback(fn):
+                last_pct = [0]
+                def _cb(sent, total):
+                    if total == 0:
+                        return
+                    pct = int(sent * 100 / total)
+                    if pct >= last_pct[0] + 10:
+                        last_pct[0] = pct
+                        push_log(f"\u2b06\ufe0f {fn}: {pct}%")
+                        with _upload_progress_lock:
+                            _upload_progress[fn] = pct
+                return _cb
+
+            push_log(f"\u2b06\ufe0f  Uploading {fname}...")
+
+            # Improvement 1: retry with exponential backoff
+            last_exc = None
+            for attempt in range(MAX_RETRIES):
+                try:
+                    await client.send_file(
+                        channel_id, str(tmp), caption=cap,
+                        force_document=True,
+                        progress_callback=make_progress_callback(fname)
+                    )
+                    last_exc = None
+                    break
+                except FloodWaitError as e:
+                    push_log(f"\u23f3 Flood wait {e.seconds}s (attempt {attempt+1})")
+                    await asyncio.sleep(e.seconds)
+                    last_exc = e
+                except (ConnectionError, TimeoutError, OSError) as e:
+                    last_exc = e
+                    if attempt < MAX_RETRIES - 1:
+                        wait = RETRY_DELAYS[attempt]
+                        push_log(f"\U0001f504 Retry {attempt+1}/{MAX_RETRIES} for {fname} in {wait}s...")
+                        await asyncio.sleep(wait)
+                    else:
+                        push_log(f"\u274c Failed after {MAX_RETRIES} attempts: {fname}")
+                        raise
+                except Exception:
+                    raise
+
+            with _upload_progress_lock:
+                _upload_progress.pop(fname, None)
+
             mark_uploaded(conn, fhash, fname, sz, local_path)
-            
-            # ✅ NEW: If delete_after_backup enabled, try to delete file immediately
+
+            # Bug 6 Fix: yield then verify by hash before deleting
+            await asyncio.sleep(0)
             if delete_after_backup and backup_folder:
-                try_delete_file_after_backup(conn, local_path, backup_folder)
-            
+                if is_uploaded(conn, fhash):
+                    try_delete_file_after_backup(conn, local_path, backup_folder, fhash)
+                else:
+                    push_log(f"\u26a0\ufe0f Could not verify upload for deletion: {fname}")
+
+            # Remove from failed list if previously failed
+            remove_failed_upload(conn, local_path)
             return True
+
         except Exception as e:
-            push_log(f"❌ Failed {fname}: {e}")
+            push_log(f"\u274c Failed {fname}: {e}")
+            with _upload_progress_lock:
+                _upload_progress.pop(fname, None)
             try:
-                conn.execute("DELETE FROM uploads WHERE uuid=?", (fhash,))
-                conn.commit()
-            except:
+                with _db_lock:
+                    conn.execute("DELETE FROM uploads WHERE uuid=?", (fhash,))
+                    conn.commit()
+            except Exception:
                 pass
+            # Improvement 1: record in failed_uploads after all retries exhausted
+            mark_failed_upload(conn, local_path, fname, e)
             return False
         finally:
             if tmp and tmp.exists():
@@ -727,6 +997,8 @@ async def _upload_one(client, conn, channel_id, fp, sz, fhash, sem, export_dir, 
                     tmp.unlink()
                 except Exception:
                     pass
+            with _uploading_lock:
+                _uploading_now.discard(fhash)
 
 def start_daemon():
     global _daemon_loop
@@ -799,13 +1071,20 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/":
                 self.send_html(DASHBOARD_HTML)
             elif path == "/api/state":
-                self.send_json({**state, "logs": list(state["logs"])[-50:]})
+                with _upload_progress_lock:
+                    prog = dict(_upload_progress)
+                self.send_json({**state, "logs": list(state["logs"])[-50:], "upload_progress": prog})
             elif path == "/api/config":
                 self.send_json(load_config())
             elif path == "/api/detect_icloud":
                 self.send_json({"path": detect_icloud()})
             elif path == "/api/update_info":
-                self.send_json({**update_state, "current": APP_VERSION})
+                self.send_json({**update_state, "current": APP_VERSION, "frozen": getattr(sys, 'frozen', False)})
+            elif path == "/api/failed_files":
+                _c = db_pool.get_connection()
+                rows = get_failed_uploads(_c) if _c else []
+                db_pool.return_connection(_c)
+                self.send_json([{"path": r[0], "filename": r[1], "reason": r[2], "count": r[3], "last": r[4]} for r in rows])
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -934,6 +1213,27 @@ class Handler(BaseHTTPRequestHandler):
                     os._exit(0)
                 threading.Thread(target=_shutdown).start()
 
+            elif path == "/api/do_update":
+                url = update_state.get("url", "")
+                if not url:
+                    self.send_json({"ok": False, "error": "No update URL available"})
+                else:
+                    self.send_json({"ok": True, "msg": "Update started..."})
+                    threading.Thread(target=do_self_update, args=(url,), daemon=True).start()
+
+            elif path == "/api/retry_failed":
+                local_path = body.get("path", "")
+                if local_path and os.path.exists(local_path):
+                    _c = db_pool.get_connection()
+                    if _c:
+                        remove_failed_upload(_c, local_path)
+                        db_pool.return_connection(_c)
+                    with pending_files_lock:
+                        pending_files.add(local_path)
+                    self.send_json({"ok": True})
+                else:
+                    self.send_json({"ok": False, "error": "File not found"})
+
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -1000,13 +1300,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </head>
 <body>
 <div class="app">
-  <h1>📸 Telegram Backup Pro v2.2.3</h1>
+  <h1>📸 Telegram Backup Pro v3.0.0</h1>
   <p class="sub">Backup your photos & videos to Telegram — automatically.<br><span style="color:#58a6ff;font-weight:600;">Developed by Shithel</span></p>
 
-  <div id="update-banner" style="display:none;background:#1c2a14;border:1px solid #3fb950;border-radius:10px;padding:12px 18px;margin-bottom:16px;display:none;align-items:center;gap:12px;">
+  <div id="update-banner" style="display:none;background:#1c2a14;border:1px solid #3fb950;border-radius:10px;padding:12px 18px;margin-bottom:16px;align-items:center;gap:12px;">
     <span style="font-size:1.1rem;">🆕</span>
     <span id="update-text" style="flex:1;font-size:.9rem;"></span>
-    <a id="update-link" href="#" target="_blank" style="background:#238636;color:#fff;padding:7px 16px;border-radius:6px;text-decoration:none;font-size:.85rem;font-weight:600;">Download Update</a>
+    <button id="update-btn" onclick="doUpdate()" style="background:#238636;color:#fff;padding:7px 16px;border-radius:6px;border:none;font-size:.85rem;font-weight:600;cursor:pointer;">⬇️ Download &amp; Install Update</button>
   </div>
 
   <div class="tabs">
@@ -1039,6 +1339,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="card">
       <h2>Live Log</h2>
       <div id="logbox">Waiting for activity…</div>
+      <div id="progress-section" style="margin-top:10px;"></div>
+    </div>
+    <div id="failed-card" class="card" style="display:none;">
+      <h2 style="color:#f85149;">⚠️ Failed Uploads</h2>
+      <div id="failed-list"></div>
+      <button class="btn-blue btn-sm" style="margin-top:10px;" onclick="retryAll()">&#x1f504; Retry All</button>
     </div>
   </div>
 
@@ -1200,6 +1506,27 @@ async function poll(){
     }
     document.getElementById('cleanup-banner').style.display=d.cleanup_enabled?'block':'none';
     document.getElementById('delete-banner').style.display=d.delete_after_backup_enabled?'block':'none';
+    // Improvement 2: show per-file progress bars
+    const ps=document.getElementById('progress-section');
+    if(d.upload_progress && Object.keys(d.upload_progress).length>0){
+      ps.innerHTML=Object.entries(d.upload_progress).map(([fn,pct])=>
+        `<div style="margin-bottom:6px;"><span style="font-size:.8rem;color:#8b949e;">${fn}</span>`+
+        `<div style="background:#21262d;border-radius:4px;height:8px;margin-top:3px;"><div style="background:#58a6ff;width:${pct}%;height:8px;border-radius:4px;transition:width .3s;"></div></div></div>`
+      ).join('');
+    }else{ps.innerHTML='';}
+    // Improvement 1: show failed files
+    try{
+      const fl=await api('GET','/api/failed_files');
+      const fc=document.getElementById('failed-card');
+      const flst=document.getElementById('failed-list');
+      if(fl.length>0){
+        fc.style.display='block';
+        flst.innerHTML=fl.map(f=>`<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;padding:8px;background:#0d1117;border-radius:6px;">`+
+          `<div style="flex:1;"><div style="font-size:.85rem;">${f.filename}</div><div style="font-size:.75rem;color:#8b949e;">${f.reason} &bull; ${f.count}x</div></div>`+
+          `<button class="btn-blue btn-sm" onclick="retryFile('${f.path.replace(/'/g,"\\'")}')">&#x1f504; Retry</button></div>`
+        ).join('');
+      }else{fc.style.display='none';}
+    }catch(e){}
   }catch(e){}
 }
 
@@ -1221,16 +1548,38 @@ loadConfig();
 setInterval(poll,5000);
 poll();
 
+async function retryFile(path){
+  await api('POST','/api/retry_failed',{path});
+  poll();
+}
+async function retryAll(){
+  const fl=await api('GET','/api/failed_files');
+  for(const f of fl) await api('POST','/api/retry_failed',{path:f.path});
+  poll();
+}
+
 async function checkUpdate(){
   try{
     const u=await api('GET','/api/update_info');
     if(u.available){
       const b=document.getElementById('update-banner');
-      document.getElementById('update-text').textContent=`New version v${u.latest} is available! (You have v${u.current})`;
-      document.getElementById('update-link').href=u.url;
+      document.getElementById('update-text').textContent=`New version v${u.latest} available! (You have v${u.current})`;
+      const btn=document.getElementById('update-btn');
+      if(u.frozen){
+        btn.style.display='inline-block';
+      }else{
+        btn.textContent=`\ud83d\udce5 New version — run: git pull && python app_web.py`;
+        btn.onclick=null; btn.style.cursor='default';
+      }
       b.style.display='flex';
     }
   }catch(e){}
+}
+async function doUpdate(){
+  const btn=document.getElementById('update-btn');
+  btn.disabled=true; btn.textContent='\u23f3 Downloading...';
+  const r=await api('POST','/api/do_update',{});
+  if(!r.ok){btn.disabled=false;btn.textContent='\u2b07\ufe0f Download & Install Update';alert(r.error||'Update failed');}
 }
 checkUpdate();
 setInterval(checkUpdate,300000);
@@ -1238,17 +1587,29 @@ setInterval(checkUpdate,300000);
 </body>
 </html>"""
 
-# ── Entry point ────────────────────────────────────────────────────────
+# ── Session validity check (Bug 8 Fix) ────────────────────────────────────
+def is_session_valid() -> bool:
+    """Quick check if a Telethon session file exists and is non-empty."""
+    for candidate in [Path(SESSION_FILE + ".session"), Path(SESSION_FILE)]:
+        if candidate.exists() and candidate.stat().st_size > 0:
+            return True
+    return False
+
+# ── Entry point ────────────────────────────────────────────────────
 if __name__ == "__main__":
     cfg = load_config()
 
-    if Path(SESSION_FILE).exists():
+    if Path(SESSION_FILE).exists() or is_session_valid():
         state["authorized"] = True
 
+    # Bug 8 Fix: only auto-start if session file is valid
     if cfg.get("auto_start_backup") and cfg.get("channel_id") and cfg.get("photos_path"):
-        state["status"] = "running"
-        push_log("🚀 Auto-starting backup...")
-        threading.Thread(target=start_daemon, daemon=True).start()
+        if is_session_valid():
+            state["status"] = "running"
+            push_log("\U0001f680 Auto-starting backup...")
+            threading.Thread(target=start_daemon, daemon=True).start()
+        else:
+            push_log("\u26a0\ufe0f Auto-start skipped: not logged in yet. Please log in from the Telegram Login tab.")
 
     print(f"\n{'='*50}")
     print(f"  Telegram Backup Pro v{APP_VERSION}")
