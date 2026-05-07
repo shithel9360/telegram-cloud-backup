@@ -1,40 +1,33 @@
 """
-Telegram Backup Pro — Web Edition (v3.0.0)
+Telegram Backup Pro — Web Edition (v3.1.0)
 Single-file web app. Run with: python app_web.py
 Then open: http://localhost:7878
 
-IMPROVEMENTS IN v2.3.0:
-- BUG 1 FIX: validate_path() rewritten to allow iCloud paths (C:\\iCloudDrive etc)
-- BUG 1 FIX: detect_icloud() now searches all Windows iCloud locations
-- BUG 1 FIX: try_delete_file_after_backup() falls back to hash-based DB check
-- BUG 2A FIX: clean_inflight_entries() removes stuck IN_FLIGHT DB rows on startup
-- BUG 2B FIX: compute_file_hash() skips placeholders, uses mtime-aware cache
-- BUG 2C FIX: _uploading_now set prevents concurrent duplicate uploads
-- BUG 2D FIX: Full rescan throttled to once per 60 seconds
-- BUG 3 FIX: do_self_update() downloads and applies .exe update automatically
-- BUG 4 FIX: File gather merges watcher events + periodic walk cleanly
-- BUG 5 FIX: 5-second cooldown added after each upload batch
-- BUG 6 FIX: Delete-after-backup now verifies by hash before deleting
-- BUG 7 FIX: SQLite connections use check_same_thread=False + _db_lock
-- BUG 8 FIX: Auto-start skipped if session file missing/empty
-- BUG 9 FIX: cleanup_icloud_storage() skips files outside current backup folder
-- BUG 10 FIX: Update banner uses POST /api/do_update with progress feedback
+NEW IN v3.1.0:
+- FIX 1: Full Telegram 2FA (Two-Step Verification) support in login flow
+- FIX 2: iCloud placeholder detection via Windows file attributes (no corrupt uploads)
+- FIX 3: CSRF token on all POST endpoints (security hardening)
+- FIX 4: Log file rotation (RotatingFileHandler, max 5MB x 3 = 15MB total)
+- FIX 5: Temp upload files auto-cleaned on startup (prevents disk bloat)
+- FIX 6: LRU hash cache (max 10,000 entries) prevents unbounded RAM growth
+- FIX 7: Windows toast notifications + browser notifications on backup complete
 
-IMPROVEMENTS IN v2.2.3:
-- FIX: Bundled watchdog module in .exe (fixes 'No module named watchdog' crash on launch)
+NEW IN v3.0.0:
+- BUG 1-10 FIX: See v3.0.0 changelog
+- NEW: Upload retry with exponential backoff (3 attempts: 5s, 15s, 45s)
+- NEW: Real per-file upload progress via Telethon progress_callback
+- NEW: Failed uploads table + retry UI in dashboard
 
-IMPROVEMENTS IN v2.2.2:
-- NEW: Instant delete after backup feature (immediately frees iCloud space)
-- Security: SQL injection prevention, path traversal protection, input validation
-- Stability: Event loop cleanup, database error handling, resource management
-- Robustness: Permission error handling, file cleanup, config validation
+NEW IN v2.2.x:
+- Instant delete after backup, path validation, watchdog bundled
 """
 
-import os, sys, json, time, asyncio, threading, logging, shutil, tempfile, sqlite3, hashlib
+import os, sys, json, time, asyncio, threading, logging, shutil, tempfile, sqlite3, hashlib, secrets
 from pathlib import Path
 from datetime import datetime
-from collections import deque
+from collections import deque, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from logging.handlers import RotatingFileHandler
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
@@ -45,16 +38,22 @@ SESSION_FILE = str(Path.home() / ".tele_backup_session")
 APPDATA      = Path(os.environ.get("APPDATA", Path.home())) / "TelegramBackupPro"
 APPDATA.mkdir(parents=True, exist_ok=True)
 LOG_FILE     = APPDATA / "backup.log"
+EXPORT_DIR   = APPDATA / "upload_temp"          # v3.1.0: stable temp dir
+EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 PORT         = 7878
 
 TELEGRAM_API_ID   = 36355055
 TELEGRAM_API_HASH = "9b819327f0403ce37b08e316a8464cb6"
 
-APP_VERSION  = "3.0.0"
+APP_VERSION  = "3.1.0"
 
 # Improvement 1: Upload retry settings
 MAX_RETRIES   = 3
 RETRY_DELAYS  = [5, 15, 45]   # seconds between attempts
+
+# v3.1.0 constants
+MAX_LOG_LINES  = 200
+MIN_MEDIA_SIZE = 10 * 1024   # 10 KB — below this an image/video is likely a stub
 GITHUB_REPO  = "shithel9360/telegram-cloud-backup"
 RELEASES_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
@@ -70,12 +69,39 @@ MAX_PHONE_LEN = 15
 MIN_CLEANUP_DAYS = 1
 MAX_CLEANUP_DAYS = 365
 
+_rotating_handler = RotatingFileHandler(
+    LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8"), logging.StreamHandler()]
+    handlers=[_rotating_handler, logging.StreamHandler()]
 )
 logger = logging.getLogger("BackupPro")
+
+# v3.1.0: CSRF token for POST endpoint protection
+_csrf_token = secrets.token_hex(16)
+
+# v3.1.0: Clean up leftover temp files from crashed sessions
+def cleanup_temp_on_startup():
+    try:
+        files_cleaned = bytes_cleaned = 0
+        for f in EXPORT_DIR.iterdir():
+            if f.is_file():
+                try:
+                    bytes_cleaned += f.stat().st_size
+                    f.unlink()
+                    files_cleaned += 1
+                except Exception:
+                    pass
+        if files_cleaned > 0:
+            logging.getLogger("BackupPro").info(
+                f"Startup cleanup: removed {files_cleaned} temp files"
+            )
+    except Exception as e:
+        logging.getLogger("BackupPro").warning(f"Startup cleanup failed: {e}")
+
+cleanup_temp_on_startup()
 
 # ── Input Validation (NEW - Security Fix) ────────────────────────────
 def validate_phone(phone: str) -> bool:
@@ -260,7 +286,7 @@ def set_windows_startup(enabled: bool):
 # ── Shared state (fix #6) ──────────────────────────────────────────────
 state = {
     "status": "idle",
-    "logs":   deque(maxlen=200),
+    "logs":   deque(maxlen=MAX_LOG_LINES),
     "count":  0,
     "size_str": "0 B",
     "authorized": False,
@@ -268,6 +294,7 @@ state = {
     "cleanup_count": 0,
     "delete_after_backup_enabled": False,
     "deleted_count": 0,
+    "skipped_placeholders": 0,   # v3.1.0
 }
 
 def push_log(msg: str):
@@ -456,32 +483,131 @@ def detect_icloud():
             continue
     return str(Path.home() / "Pictures")
 
-# ── File hashing (Bug 2B Fix: mtime-aware cache + placeholder detection) ────────────
-_hash_cache      = {}  # {filepath: (mtime, hash_value)}
-_hash_cache_lock = threading.Lock()
+
+# ── LRU Hash Cache (v3.1.0 Fix 6: bounded RAM) ────────────────────────────
+class LRUHashCache:
+    def __init__(self, maxsize=10000):
+        self.cache   = OrderedDict()
+        self.maxsize = maxsize
+        self.lock    = threading.Lock()
+
+    def get(self, key):
+        with self.lock:
+            if key not in self.cache:
+                return None
+            self.cache.move_to_end(key)
+            return self.cache[key]
+
+    def set(self, key, value):
+        with self.lock:
+            if key in self.cache:
+                self.cache.move_to_end(key)
+            self.cache[key] = value
+            if len(self.cache) > self.maxsize:
+                self.cache.popitem(last=False)
+
+    def invalidate(self, key):
+        with self.lock:
+            self.cache.pop(key, None)
+
+    def clear(self):
+        with self.lock:
+            self.cache.clear()
+
+_hash_cache = LRUHashCache(maxsize=10000)
+
 
 def compute_file_hash(filepath, use_cache=True):
-    """Compute MD5 hash of file content"""
+    """MD5 hash with LRU mtime-aware cache; skips iCloud placeholders."""
+    fp_str = str(filepath)
+    # Skip .icloud placeholder stubs
+    if fp_str.lower().endswith('.icloud'):
+        return None
+    try:
+        stat_info     = os.stat(fp_str)
+        file_size     = stat_info.st_size
+        current_mtime = stat_info.st_mtime
+        if os.path.getsize(fp_str) != file_size:
+            return None  # file being written
+        ext = os.path.splitext(fp_str)[1].lower()
+        if file_size < 1024 and ext in IMAGE_EXT + VIDEO_EXT:
+            return None  # tiny stub
+    except OSError:
+        return None
+
     if use_cache:
-        with _hash_cache_lock:
-            if filepath in _hash_cache:
-                return _hash_cache[filepath]
-    
+        cached = _hash_cache.get(fp_str)
+        if cached is not None:
+            stored_mtime, stored_hash = cached
+            if abs(current_mtime - stored_mtime) < 1.0:
+                return stored_hash
+
     try:
         hash_obj = hashlib.md5()
-        with open(filepath, 'rb') as f:
-            for chunk in iter(lambda: f.read(8192), b''):
+        with open(fp_str, 'rb') as f:
+            for chunk in iter(lambda: f.read(65536), b''):  # 64KB chunks
                 hash_obj.update(chunk)
         result = hash_obj.hexdigest()
-        
         if use_cache:
-            with _hash_cache_lock:
-                _hash_cache[filepath] = result
-        
+            _hash_cache.set(fp_str, (current_mtime, result))
         return result
     except (OSError, IOError) as e:
         logger.error(f"Failed to hash file: {e}")
         return None
+
+
+# ── iCloud placeholder detection (v3.1.0 Fix 2) ──────────────────────────
+def is_icloud_placeholder(filepath: str) -> bool:
+    """Return True if the file is an iCloud online-only placeholder (Windows)."""
+    if sys.platform != 'win32':
+        return False
+    try:
+        import ctypes
+        attrs = ctypes.windll.kernel32.GetFileAttributesW(filepath)
+        if attrs == 0xFFFFFFFF:  # INVALID_FILE_ATTRIBUTES
+            return False
+        OFFLINE               = 0x1000
+        RECALL_ON_DATA_ACCESS = 0x00400000
+        RECALL_ON_OPEN        = 0x00040000
+        return bool(attrs & (OFFLINE | RECALL_ON_DATA_ACCESS | RECALL_ON_OPEN))
+    except Exception:
+        return False
+
+
+# ── Windows toast notifications (v3.1.0 Fix 7) ─────────────────────────
+def send_windows_notification(title: str, message: str):
+    """Send Windows 10/11 toast notification via PowerShell (silent on failure)."""
+    if sys.platform != 'win32':
+        return
+    try:
+        import subprocess
+        ps = f"""
+[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime] | Out-Null
+[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType=WindowsRuntime] | Out-Null
+$xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+$xml.LoadXml('<toast><visual><binding template="ToastGeneric"><text>{title}</text><text>{message}</text></binding></visual></toast>')
+$toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
+$notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Telegram Backup Pro')
+$notifier.Show($toast)
+"""
+        subprocess.run(
+            ["powershell", "-WindowStyle", "Hidden", "-Command", ps],
+            capture_output=True, timeout=5
+        )
+    except Exception as e:
+        logger.debug(f"Notification failed: {e}")
+
+
+# ── Temp disk usage check ─────────────────────────────────────────────
+def check_temp_disk_usage():
+    """Warn if upload temp dir exceeds 500 MB."""
+    try:
+        if EXPORT_DIR.exists():
+            total = sum(f.stat().st_size for f in EXPORT_DIR.iterdir() if f.is_file())
+            if total > 500 * 1024 * 1024:
+                push_log(f"\u26a0\ufe0f Temp directory is large: {fmt_size(total)}. Possible stuck uploads.")
+    except Exception:
+        pass
 
 # ── File system watcher (fix #1) ───────────────────────────────────────
 pending_files      = set()
@@ -784,18 +910,16 @@ async def _daemon(cfg):
     # Bug 2A Fix: clean any stuck IN_FLIGHT rows from a previous crash
     clean_inflight_entries(conn)
 
-    export = Path(tempfile.gettempdir()) / "tele_backup_export"
-    try:
-        export.mkdir(exist_ok=True)
-    except Exception as e:
-        push_log(f"\u26a0\ufe0f Failed to create temp directory: {e}")
-        export = Path(tempfile.gettempdir())
+    # v3.1.0 Fix 5: use stable APPDATA temp dir instead of system temp
+    export = EXPORT_DIR
 
     push_log(f"\u2705 Connected! Watching: {photos_path}")
     state["cleanup_enabled"]             = cleanup_after_backup
     state["delete_after_backup_enabled"] = delete_after_backup
 
     last_full_scan_time = 0.0  # Bug 2D/4 Fix: throttle full scans
+    total_uploaded      = 0    # v3.1.0: for completion notification
+    _daemon_error       = False
 
     try:
         while state["status"] == "running":
@@ -830,11 +954,27 @@ async def _daemon(cfg):
                 now2      = time.time()
                 file_hashes: dict = {}
                 for fp in files_to_check:
+                    fname = os.path.basename(fp)
+                    # v3.1.0 Fix 2: skip .icloud stub files
+                    if fp.lower().endswith('.icloud'):
+                        state["skipped_placeholders"] += 1
+                        continue
+                    # v3.1.0 Fix 2: skip Windows online-only placeholders
+                    if is_icloud_placeholder(fp):
+                        push_log(f"\u23ed\ufe0f Skipped (iCloud placeholder not downloaded): {fname}")
+                        state["skipped_placeholders"] += 1
+                        continue
                     try:
                         mtime = os.path.getmtime(fp)
+                        sz_check = os.path.getsize(fp)
                     except OSError:
                         continue
                     if now2 - mtime < 3:
+                        continue
+                    # v3.1.0 Fix 2: size sanity check for image stubs
+                    if sz_check < MIN_MEDIA_SIZE and os.path.splitext(fp)[1].lower() in IMAGE_EXT:
+                        push_log(f"\u23ed\ufe0f Skipped (too small, likely placeholder): {fname} ({sz_check}B)")
+                        state["skipped_placeholders"] += 1
                         continue
                     fhash = compute_file_hash(fp, use_cache=True)
                     if fhash:
@@ -866,12 +1006,16 @@ async def _daemon(cfg):
                     results = await asyncio.gather(*tasks, return_exceptions=True)
                     ok = sum(1 for r in results if r is True)
                     if ok:
+                        total_uploaded += ok
                         push_log(f"\u2705 Uploaded {ok} new file(s).")
                         if cleanup_after_backup:
                             await asyncio.sleep(2)
                             cleanup_icloud_storage(conn, cleanup_days, photos_path)
                     # Bug 5 Fix: cooldown after upload batch
                     await asyncio.sleep(5)
+
+                # v3.1.0 Fix 5: check temp disk usage each iteration
+                check_temp_disk_usage()
 
                 cnt, raw = get_stats(conn)
                 state["count"]    = cnt
@@ -882,6 +1026,7 @@ async def _daemon(cfg):
                 await asyncio.sleep(e.seconds)
             except Exception as e:
                 push_log(f"\u26a0\ufe0f Error: {e}")
+                _daemon_error = True
                 await asyncio.sleep(5)
 
     finally:
@@ -889,6 +1034,17 @@ async def _daemon(cfg):
         db_pool.return_connection(conn)
         stop_file_watcher()
         push_log("\U0001f6d1 Daemon stopped.")
+        # v3.1.0 Fix 7: Windows & browser-visible notifications
+        if total_uploaded > 0 and not _daemon_error:
+            send_windows_notification(
+                "\u2705 Backup Complete",
+                f"Telegram Backup Pro: {total_uploaded} file(s) uploaded successfully"
+            )
+        elif _daemon_error:
+            send_windows_notification(
+                "\u26a0\ufe0f Backup Stopped",
+                "Telegram Backup Pro stopped unexpectedly. Check the dashboard."
+            )
 
 async def _upload_one(client, conn, channel_id, fp, sz, fhash, sem, export_dir, local_path="", backup_folder="", delete_after_backup=False):
     """Upload one file with retry, progress, dedup guard, and hash-verified delete."""
@@ -1027,14 +1183,40 @@ async def _send_otp(phone):
     await client.disconnect()
 
 async def _verify_otp(code):
+    """Sign in with OTP; detects 2FA and signals caller via SessionPasswordNeededError."""
     from telethon import TelegramClient
+    from telethon.errors import SessionPasswordNeededError
     client = TelegramClient(SESSION_FILE, TELEGRAM_API_ID, TELEGRAM_API_HASH)
     await client.connect()
-    await client.sign_in(_login_state["phone"], code, phone_code_hash=_login_state["hash"])
+    try:
+        await client.sign_in(
+            _login_state["phone"], code,
+            phone_code_hash=_login_state["hash"]
+        )
+    except SessionPasswordNeededError:
+        _login_state["step"] = "waiting_2fa"
+        await client.disconnect()
+        raise  # re-raise so handler can send needs_2fa response
     me = await client.get_me()
     state["authorized"] = True
     await client.disconnect()
     return me.first_name
+
+
+async def _verify_2fa(password: str):
+    """Complete login for 2FA-enabled accounts."""
+    from telethon import TelegramClient
+    from telethon.errors import PasswordHashInvalidError
+    client = TelegramClient(SESSION_FILE, TELEGRAM_API_ID, TELEGRAM_API_HASH)
+    await client.connect()
+    try:
+        me = await client.sign_in(password=password)
+        state["authorized"] = True
+        return me.first_name
+    except PasswordHashInvalidError:
+        raise ValueError("Incorrect 2FA password. Please try again.")
+    finally:
+        await client.disconnect()
 
 # ── HTTP Server ────────────────────────────────────────────────────────
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -1069,7 +1251,9 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         try:
             if path == "/":
-                self.send_html(DASHBOARD_HTML)
+                # v3.1.0: inject CSRF token + PORT into HTML
+                html = DASHBOARD_HTML.replace("{{CSRF_TOKEN}}", _csrf_token).replace("{{PORT}}", str(PORT))
+                self.send_html(html)
             elif path == "/api/state":
                 with _upload_progress_lock:
                     prog = dict(_upload_progress)
@@ -1094,18 +1278,24 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         try:
+            # v3.1.0 Fix 3: CSRF token check on all POST requests
+            token = self.headers.get("X-Backup-Token", "")
+            if token != _csrf_token:
+                self.send_json({"error": "Unauthorized"}, 403)
+                return
+
             # Security Fix #10: Validate content length
             length = int(self.headers.get("Content-Length", 0))
             if length > MAX_BODY_SIZE:
                 self.send_json({"error": "Request too large"}, 413)
                 return
-            
+
             try:
                 body = json.loads(self.rfile.read(length) or b"{}")
             except json.JSONDecodeError:
                 self.send_json({"error": "Invalid JSON"}, 400)
                 return
-            
+
             path = self.path
 
             if path == "/api/send_otp":
@@ -1131,20 +1321,58 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"ok": False, "error": str(e)})
 
             elif path == "/api/verify_otp":
-                code = body.get("code","").strip()
+                code = body.get("code", "").strip()
                 try:
+                    from telethon.errors import SessionPasswordNeededError
                     loop = asyncio.new_event_loop()
                     try:
                         asyncio.set_event_loop(loop)
                         name = loop.run_until_complete(_verify_otp(code))
                     finally:
                         loop.close()
-                    
                     cfg = load_config()
                     cfg.update({"api_id": TELEGRAM_API_ID, "api_hash": TELEGRAM_API_HASH,
                                  "phone": _login_state["phone"]})
                     save_config(cfg)
                     self.send_json({"ok": True, "name": name})
+                except SessionPasswordNeededError:
+                    self.send_json({"ok": False, "needs_2fa": True,
+                                    "error": "This account has Two-Step Verification enabled. Please enter your Telegram password."})
+                except Exception as e:
+                    self.send_json({"ok": False, "error": str(e)})
+
+            elif path == "/api/verify_2fa":
+                password = body.get("password", "").strip()
+                if not password:
+                    self.send_json({"ok": False, "error": "Password is required"})
+                    return
+                try:
+                    loop = asyncio.new_event_loop()
+                    try:
+                        asyncio.set_event_loop(loop)
+                        name = loop.run_until_complete(_verify_2fa(password))
+                    finally:
+                        loop.close()
+                    cfg = load_config()
+                    cfg.update({"api_id": TELEGRAM_API_ID, "api_hash": TELEGRAM_API_HASH,
+                                 "phone": _login_state["phone"]})
+                    save_config(cfg)
+                    self.send_json({"ok": True, "name": name})
+                except ValueError as e:
+                    self.send_json({"ok": False, "error": str(e)})
+                except Exception as e:
+                    self.send_json({"ok": False, "error": str(e)})
+
+            elif path == "/api/logout":
+                try:
+                    for candidate in [Path(SESSION_FILE + ".session"), Path(SESSION_FILE)]:
+                        if candidate.exists():
+                            candidate.unlink()
+                    state["authorized"] = False
+                    _login_state["step"] = "idle"
+                    _login_state["phone"] = ""
+                    _login_state["hash"]  = ""
+                    self.send_json({"ok": True})
                 except Exception as e:
                     self.send_json({"ok": False, "error": str(e)})
 
@@ -1321,6 +1549,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="stat"><div class="val" id="s-count">0</div><div class="key">Files Backed Up</div></div>
       <div class="stat"><div class="val" id="s-size">0 B</div><div class="key">Total Size</div></div>
       <div class="stat"><div class="val"><span class="badge idle" id="s-status">Idle</span></div><div class="key">Status</div></div>
+      <div class="stat"><div class="val" id="s-skipped" style="font-size:1.3rem;">0</div><div class="key">⏭️ Placeholders Skipped</div></div>
     </div>
     <div id="cleanup-banner" style="display:none;background:#1a3d1a;border:1px solid #3fb950;border-radius:10px;padding:12px 18px;margin-bottom:16px;">
       <span style="font-size:.9rem;color:#3fb950">✅ Storage cleanup enabled - Backed-up files will be automatically deleted after <span id="cleanup-days">30</span> days</span>
@@ -1357,13 +1586,26 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <p style="color:#8b949e;font-size:.8rem;margin-bottom:14px">
         Tip: Forward any message from your channel to @userinfobot to get the Channel ID.
       </p>
-      <button class="btn-blue" onclick="sendOtp()">Send Login Code →</button>
+      <button class="btn-blue" onclick="sendOtp()">Send Login Code &rarr;</button>
       <div id="otp-row" style="display:none;margin-top:16px">
         <div class="row"><label>Enter OTP</label><input id="otp" placeholder="Code from Telegram" /></div>
-        <button class="btn-primary" onclick="verifyOtp()">✓ Verify Code</button>
+        <button class="btn-primary" onclick="verifyOtp()">&check; Verify Code</button>
+      </div>
+      <!-- v3.1.0: 2FA section -->
+      <div id="twofa-section" style="display:none;margin-top:16px;padding:14px;background:#1a1a2e;border:1px solid #f0a500;border-radius:8px;">
+        <p style="color:#f0a500;margin-bottom:12px;font-size:.9rem;">
+          &#x1f510; This account has Two-Step Verification enabled.<br>Enter your Telegram password below.
+        </p>
+        <div class="row"><label>Telegram Password</label><input type="password" id="twofa-pass" placeholder="Your 2FA password" /></div>
+        <button class="btn-primary" onclick="verify2FA()">&#x1f511; Confirm Password</button>
       </div>
       <div id="login-msg"></div>
+      <!-- v3.1.0: Logout button -->
+      <div id="logout-row" style="display:none;margin-top:16px;padding-top:12px;border-top:1px solid #30363d;">
+        <button style="background:#b91c1c;color:#fff;border:none;padding:8px 18px;border-radius:6px;cursor:pointer;" onclick="doLogout()">&#x1f513; Logout from Telegram</button>
+      </div>
     </div>
+    <p style="text-align:center;color:#8b949e;font-size:.75rem;margin-top:8px;">&#x1f512; Dashboard is only accessible from this computer (localhost:{{PORT}})</p>
   </div>
 
   <!-- SETTINGS -->
@@ -1422,7 +1664,8 @@ function showTab(t){
 }
 
 async function api(method,path,body){
-  const r=await fetch(path,{method,headers:{'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});
+  const headers={'Content-Type':'application/json','X-Backup-Token':'{{CSRF_TOKEN}}'};
+  const r=await fetch(path,{method,headers,body:body?JSON.stringify(body):undefined});
   return r.json();
 }
 
@@ -1446,10 +1689,38 @@ async function verifyOtp(){
   setMsg('login-msg','Verifying…','');
   const r=await api('POST','/api/verify_otp',{code});
   if(r.ok){
-    setMsg('login-msg','✅ Logged in as '+r.name+'! Go to Settings to set your folder, then start backup.','ok');
+    setMsg('login-msg','\u2705 Logged in as '+r.name+'! Go to Settings to set your folder, then start backup.','ok');
+    document.getElementById('logout-row').style.display='block';
+  } else if(r.needs_2fa){
+    document.getElementById('otp-row').style.display='none';
+    document.getElementById('twofa-section').style.display='block';
+    setMsg('login-msg','','');
   } else {
-    setMsg('login-msg','❌ '+(r.error||'Error'),'err');
+    setMsg('login-msg','\u274c '+(r.error||'Error'),'err');
   }
+}
+
+async function verify2FA(){
+  const pw=document.getElementById('twofa-pass').value;
+  if(!pw){alert('Enter your 2FA password');return;}
+  setMsg('login-msg','Verifying password\u2026','');
+  const r=await api('POST','/api/verify_2fa',{password:pw});
+  if(r.ok){
+    document.getElementById('twofa-section').style.display='none';
+    document.getElementById('logout-row').style.display='block';
+    setMsg('login-msg','\u2705 Logged in as '+r.name+'! Go to Settings to set your folder, then start backup.','ok');
+  } else {
+    setMsg('login-msg','\u274c '+(r.error||'Wrong password'),'err');
+  }
+}
+
+async function doLogout(){
+  if(!confirm('This will disconnect your Telegram account. You will need to log in again to resume backups. Continue?')) return;
+  await api('POST','/api/logout',{});
+  document.getElementById('logout-row').style.display='none';
+  document.getElementById('twofa-section').style.display='none';
+  document.getElementById('otp-row').style.display='none';
+  setMsg('login-msg','\u2705 Logged out successfully.','ok');
 }
 
 async function detectiCloud(){
@@ -1506,6 +1777,14 @@ async function poll(){
     }
     document.getElementById('cleanup-banner').style.display=d.cleanup_enabled?'block':'none';
     document.getElementById('delete-banner').style.display=d.delete_after_backup_enabled?'block':'none';
+    if(document.getElementById('s-skipped')) document.getElementById('s-skipped').textContent=d.skipped_placeholders||0;
+    // v3.1.0 Fix 7: browser notification when backup transitions running->stopped
+    if(typeof _lastStatus!=='undefined' && _lastStatus==='running' && d.status==='stopped' && d.count>0){
+      if(Notification.permission==='granted'){
+        new Notification('Telegram Backup Pro',{body:`Backup complete! ${d.count} files backed up.`});
+      }
+    }
+    _lastStatus=d.status;
     // Improvement 2: show per-file progress bars
     const ps=document.getElementById('progress-section');
     if(d.upload_progress && Object.keys(d.upload_progress).length>0){
@@ -1547,6 +1826,11 @@ async function loadConfig(){
 loadConfig();
 setInterval(poll,5000);
 poll();
+// v3.1.0 Fix 7: request browser notification permission on load
+if(typeof Notification!=='undefined' && Notification.permission==='default'){
+  Notification.requestPermission();
+}
+let _lastStatus=undefined;
 
 async function retryFile(path){
   await api('POST','/api/retry_failed',{path});
