@@ -45,7 +45,7 @@ PORT         = 7878
 TELEGRAM_API_ID   = 36355055
 TELEGRAM_API_HASH = "9b819327f0403ce37b08e316a8464cb6"
 
-APP_VERSION  = "3.1.0"
+APP_VERSION  = "3.1.1"
 
 # Improvement 1: Upload retry settings
 MAX_RETRIES   = 3
@@ -69,9 +69,13 @@ MAX_PHONE_LEN = 15
 MIN_CLEANUP_DAYS = 1
 MAX_CLEANUP_DAYS = 365
 
-_rotating_handler = RotatingFileHandler(
-    LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
-)
+try:
+    _rotating_handler = RotatingFileHandler(
+        LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
+except (PermissionError, OSError):
+    # Log file locked by another instance (Windows) — fall back to stream only
+    _rotating_handler = logging.StreamHandler()
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -1907,7 +1911,19 @@ if __name__ == "__main__":
 
     threading.Thread(target=_update_check_loop, daemon=True).start()
 
-    server = HTTPServer(("127.0.0.1", PORT), Handler)
+    try:
+        server = HTTPServer(("127.0.0.1", PORT), Handler)
+    except OSError as e:
+        msg = (f"Cannot start Telegram Backup Pro.\n\n"
+               f"Port {PORT} is already in use — another instance may be running.\n\n"
+               f"Open Task Manager, find TelegramBackup.exe, and End Task, "
+               f"then launch this app again.\n\nError: {e}")
+        if sys.platform == "win32":
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(0, msg, "Telegram Backup Pro — Error", 0x10)
+        else:
+            print(msg)
+        sys.exit(1)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
